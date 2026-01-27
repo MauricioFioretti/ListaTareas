@@ -48,7 +48,11 @@ function requestAccessToken({ prompt } = {}) {
       else resolve(resp);
     };
 
-    oauthTokenClient.requestAccessToken({ prompt: prompt ?? "" });
+    // Si prompt viene undefined, NO lo mandamos (GIS a veces se pone pesado si mandás "")
+    const opts = {};
+    if (prompt !== undefined) opts.prompt = prompt;
+    oauthTokenClient.requestAccessToken(opts);
+
   });
 }
 
@@ -58,30 +62,74 @@ function isTokenValid() {
 
 // Esto intenta silent. Si falla y allowInteractive=true, abre popup.
 async function ensureOAuthToken(allowInteractive = false) {
+  // 0) si ya está en memoria, OK
   if (isTokenValid()) return oauthAccessToken;
 
-  // 1) silent
+  // 0.5) si hay token guardado, cargarlo
+  if (loadStoredOAuth() && isTokenValid()) return oauthAccessToken;
+
+  // 1) silent (siempre intentamos, pero puede fallar según navegador)
   try {
-    const r = await requestAccessToken({ prompt: "" });
+    const r = await requestAccessToken({ prompt: "none" }); // 👈 importante
     oauthAccessToken = r.access_token;
     oauthExpiresAt = Date.now() + (r.expires_in * 1000);
+    saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
     return oauthAccessToken;
   } catch { }
 
-  // 2) interactivo (solo en acciones del usuario)
+  // 2) interactivo (solo si el usuario tocó "Conectar")
   if (!allowInteractive) throw new Error("TOKEN_NEEDS_INTERACTIVE");
 
   const r = await requestAccessToken({ prompt: "consent" });
   oauthAccessToken = r.access_token;
   oauthExpiresAt = Date.now() + (r.expires_in * 1000);
+  saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
   return oauthAccessToken;
 }
+
 
 // =====================
 // Local cache/offline keys (tareas)
 // =====================
 const LS_CACHE = "tareas_drive_cache_v1";
 const LS_PENDING = "tareas_drive_pending_v1";
+
+// =====================
+// OAuth token persistente (evita pedir permisos en cada refresh)
+// =====================
+const LS_OAUTH = "tareas_oauth_token_v1";
+
+function loadStoredOAuth() {
+  try {
+    const raw = localStorage.getItem(LS_OAUTH);
+    if (!raw) return false;
+    const t = JSON.parse(raw);
+    if (!t?.access_token || !t?.expires_at) return false;
+    if (Date.now() >= (Number(t.expires_at) - 30_000)) return false;
+
+    oauthAccessToken = t.access_token;
+    oauthExpiresAt = Number(t.expires_at);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function saveStoredOAuth(accessToken, expiresAt) {
+  try {
+    localStorage.setItem(LS_OAUTH, JSON.stringify({
+      access_token: accessToken,
+      expires_at: expiresAt
+    }));
+  } catch { }
+}
+
+function clearStoredOAuth() {
+  try { localStorage.removeItem(LS_OAUTH); } catch { }
+  oauthAccessToken = "";
+  oauthExpiresAt = 0;
+}
+
 
 // =====================
 // UI construir estructura
@@ -740,6 +788,8 @@ window.addEventListener("load", async () => {
   await waitGIS();
   initOAuth();
 
+  // Intentar recuperar token guardado (para no pedir permisos en cada refresh)
+  loadStoredOAuth();
 
   // 1) cache instantáneo
   const cached = loadCache();
