@@ -1,0 +1,305 @@
+/* ======= BASE ======= */
+:root {
+  --yt-bg: #0f0f0f;
+  --yt-surface: #212121;
+  --yt-surface-2: #181818;
+  --yt-border: #3d3d3d;
+  --yt-text: #fff;
+  --yt-text-muted: #aaaaaa;
+  --yt-accent: #3ea6ff;
+  --yt-btn: #272727;
+  --yt-btn-hover: #3f3f3f;
+  --yt-danger: #cc0000;
+  --ok: #2ea043;
+  --warn: #d29922;
+}
+
+body {
+  margin: 0;
+  padding: 1.5rem;
+  background: var(--yt-bg);
+  color: var(--yt-text);
+  font-family: Arial, sans-serif;
+}
+
+/* ======= HEADER / TÍTULO ======= */
+.titulo {
+  margin-bottom: 1.0rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.titulo h1 {
+  color: #fff;
+  font-size: 1.6rem;
+  font-weight: 600;
+  margin: 0;
+}
+
+/* Estado sync */
+.sync-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: .5rem;
+  padding: .35rem .6rem;
+  border-radius: 999px;
+  font-size: .85rem;
+  border: 1px solid rgba(255,255,255,0.08);
+  background: rgba(255,255,255,0.04);
+  color: var(--yt-text-muted);
+  user-select: none;
+}
+.sync-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: var(--yt-text-muted);
+}
+.sync-pill.ok { color: #c8facc; border-color: rgba(46,160,67,.35); }
+.sync-pill.ok .sync-dot { background: var(--ok); }
+.sync-pill.saving { color: #dbeafe; border-color: rgba(62,166,255,.35); }
+.sync-pill.saving .sync-dot { background: var(--yt-accent); animation: pulse 1s infinite; }
+.sync-pill.offline { color: #ffe9c2; border-color: rgba(210,153,34,.35); }
+.sync-pill.offline .sync-dot { background: var(--warn); }
+
+@keyframes pulse {
+  0% { transform: scale(1); opacity: .6; }
+  50% { transform: scale(1.25); opacity: 1; }
+  100% { transform: scale(1); opacity: .6; }
+}
+
+/* ======= SECCIÓN AGREGAR ITEM ======= */
+.agregarItem {
+  background: var(--yt-surface);
+  padding: 1rem 1.2rem;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  margin-bottom: 1rem;
+  border: 1px solid rgba(255,255,255,0.03);
+}
+
+.agregarItem label {
+  color: var(--yt-text);
+  white-space: nowrap;
+}
+
+.agregarItem input {
+  background: #0f0f0f;
+  border: 1px solid #3d3d3d;
+  border-radius: 6px;
+  padding: 6px 8px;
+  color: #fff;
+  flex: 1;
+  min-width: 180px;
+}
+
+/* ======= BOTONES ======= */
+button {
+  background: var(--yt-btn);
+  color: #fff;
+  border: 1px solid rgba(255,255,255,0.02);
+  border-radius: 6px;
+  padding: 6px 14px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  transition: background 0.15s ease, transform 0.1s ease;
+}
+button:hover { background: var(--yt-btn-hover); }
+button:active { background: #4d4d4d; transform: scale(0.995); }
+
+.agregarItem button {
+  background: #3ea6ff;
+  color: #000;
+  border: none;
+}
+.agregarItem button:hover { background: #67b8ff; }
+
+.items .eliminar-item {
+  background: #c00;
+  border: none;
+}
+.items .eliminar-item:hover { background: #ff3b3b; }
+
+/* ======= LISTA ======= */
+.items {
+  background: var(--yt-surface);
+  border-radius: 12px;
+  padding: 0.5rem 0.3rem 0.6rem 0.3rem;
+  border: 1px solid rgba(255,255,255,0.02);
+}
+
+.item-container {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.45rem 0.8rem;
+  border-bottom: 1px solid rgba(255,255,255,0.03);
+}
+.item-container:last-child { border-bottom: none; }
+
+.item-container input[type="checkbox"] {
+  accent-color: var(--yt-accent);
+  transform: scale(1.1);
+}
+
+.item-container p {
+  color: #fff;
+  flex: 1;
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+/* ======= UTILIDADES ======= */
+.utilidades {
+  margin-top: 2rem;
+  padding-top: 1.2rem;
+  border-top: 1px solid rgba(255,255,255,0.05);
+  display: flex;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+}
+
+.copiar-lista,
+.importar-lista {
+  background: var(--yt-surface-2);
+  border-radius: 12px;
+  padding: 1rem 1.2rem;
+  min-width: 230px;
+  border: 1px solid rgba(255,255,255,0.02);
+}
+
+.copiar-lista label,
+.importar-lista label {
+  display: block;
+  margin-bottom: 0.5rem;
+  font-weight: 500;
+  color: #fff;
+}
+
+.importar-lista {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.6rem;
+  text-align: center;
+}
+
+.importar-lista textarea {
+  width: 100%;
+  max-width: 260px;
+  background: #0f0f0f;
+  border: 1px solid #3d3d3d;
+  border-radius: 8px;
+  padding: 6px 8px;
+  color: #fff;
+  resize: vertical;
+  min-height: 80px;
+}
+
+.copiar-lista button { background: #303030; }
+.copiar-lista button:hover { background: #4b4b4b; }
+
+/* ======= TOASTS ======= */
+#toast-root {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  z-index: 9999;
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: none;
+  background: rgba(25,25,25,0.95);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 12px;
+  padding: 10px 12px;
+  min-width: 220px;
+  max-width: 320px;
+  box-shadow: 0 10px 35px rgba(0,0,0,0.35);
+  color: #fff;
+  font-size: 0.92rem;
+  animation: toastIn .15s ease-out;
+}
+
+.toast .small {
+  color: var(--yt-text-muted);
+  font-size: 0.82rem;
+  margin-top: 4px;
+}
+
+.toast.ok { border-color: rgba(46,160,67,.35); }
+.toast.warn { border-color: rgba(210,153,34,.35); }
+.toast.err { border-color: rgba(255,59,59,.35); }
+
+@keyframes toastIn {
+  from { transform: translateY(10px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+/* ====== Responsivo ====== */
+@media (max-width: 600px) {
+  body { padding: 1rem; }
+  .agregarItem { flex-wrap: wrap; }
+  .utilidades { flex-direction: column; }
+  .items { padding: 0.5rem 0rem 0.6rem 0rem; }
+  #toast-root { right: 12px; bottom: 12px; }
+
+  /* 1) Label e input arriba */
+  .agregarItem label { flex: 0 0 auto; }
+
+  .agregarItem input[type="text"] {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+
+  /* 2) Botón Agregar en su propia línea */
+  .agregarItem > button {
+    flex: 0 0 100%;
+    width: 100%;
+  }
+
+  /* 3) Buscador (wrapper) en su propia línea */
+  .agregarItem > div {
+    flex: 0 0 100%;
+    width: 100%;
+    margin-left: 0 !important;
+    margin-top: 10px;
+  }
+
+  .agregarItem > div input {
+    width: 100%;
+    min-width: 0;
+  }
+}
+
+/* ====== Tablet ====== */
+@media (min-width: 601px) and (max-width: 900px) {
+  .agregarItem {
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+
+  .agregarItem label { flex: 0 0 auto; }
+
+  .agregarItem input[type="text"] {
+    flex: 1 1 260px;
+    min-width: 220px;
+  }
+
+  .agregarItem button { flex: 0 0 auto; }
+
+  .agregarItem > div {
+    flex: 1 1 100%;
+    margin-left: 0 !important;
+    margin-top: 10px;
+  }
+
+  .agregarItem > div input { min-width: 0; }
+}
