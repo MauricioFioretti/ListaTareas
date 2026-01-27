@@ -14,6 +14,14 @@ const OAUTH_CLIENT_ID = "917192108969-6d693ji2l5ku1vsje8s6brvio2j01hio.apps.goog
 // scope mínimo para identificar al usuario (email)
 const OAUTH_SCOPES = "openid email profile";
 
+async function forceSwitchAccount() {
+  // obliga a Google a mostrar el selector de cuenta
+  oauthAccessToken = "";
+  oauthExpiresAt = 0;
+  await ensureOAuthToken(true, "select_account");
+}
+
+
 let oauthTokenClient = null;
 let oauthAccessToken = "";
 let oauthExpiresAt = 0;
@@ -75,7 +83,7 @@ function isTokenValid() {
 }
 
 // Esto intenta silent. Si falla y allowInteractive=true, abre popup.
-async function ensureOAuthToken(allowInteractive = false) {
+async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "consent") {
   // 0) si ya está en memoria, OK
   if (isTokenValid()) return oauthAccessToken;
 
@@ -94,7 +102,7 @@ async function ensureOAuthToken(allowInteractive = false) {
   // 2) interactivo (solo si el usuario tocó "Conectar")
   if (!allowInteractive) throw new Error("TOKEN_NEEDS_INTERACTIVE");
 
-  const r = await requestAccessToken({ prompt: "consent" });
+  const r = await requestAccessToken({ prompt: interactivePrompt || "consent" });
   oauthAccessToken = r.access_token;
   oauthExpiresAt = Date.now() + (r.expires_in * 1000);
   saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
@@ -172,7 +180,7 @@ titulo.appendChild(btnConnect);
 btnConnect.addEventListener("click", async () => {
   try {
     setSync("saving", "Autorizando…");
-    await ensureOAuthToken(true);
+    await ensureOAuthToken(true, "select_account");
     await refreshFromRemote(true);
     setSync("ok", "Conectado ✅");
     toast("Conectado ✅", "ok", "Ya podés sincronizar con Drive.");
@@ -181,8 +189,6 @@ btnConnect.addEventListener("click", async () => {
     toast("No se pudo autorizar", "err", e?.message || "");
   }
 });
-
-
 
 const main = document.querySelector("main");
 
@@ -575,6 +581,22 @@ function scheduleSave(reason = "") {
     try {
       const startedVersion = localVersion;
 
+      // Verificación rápida de cuenta/autorización antes de intentar guardar
+      try {
+        const check = await apiGetJSONP("get");
+        if (check?.ok === false && (check?.error === "forbidden" || check?.error === "auth_required")) {
+          setSync("offline", "Cuenta no autorizada");
+          toast("Cuenta no autorizada", "err", "Tocá Conectar y elegí otra cuenta.");
+          return;
+        }
+      } catch (e) {
+        if ((e?.message || "") === "TOKEN_NEEDS_INTERACTIVE") {
+          setSync("offline", "Necesita Conectar");
+          toast("Necesitás autorizar", "warn", "Tocá el botón Conectar.");
+          return;
+        }
+      }
+
       await apiSet(listaItems);
       setPending(listaItems);
 
@@ -673,6 +695,30 @@ async function refreshFromRemote(showToast = true) {
   }
   try {
     const resp = await apiGetJSONP("get");
+
+    // Backend auth handling
+    if (resp?.ok === false && (resp?.error === "forbidden" || resp?.error === "auth_required")) {
+      setSync("offline", "Cuenta no autorizada");
+      toast("Cuenta no autorizada", "err", "Elegí otra cuenta para Conectar.");
+      // Fuerza selector de cuenta
+      try {
+        await ensureOAuthToken(true, "select_account");
+        // reintenta una vez ya con otra cuenta
+        const resp2 = await apiGetJSONP("get");
+        if (resp2?.ok === true) {
+          listaItems = dedupNormalize(Array.isArray(resp2.items) ? resp2.items : []);
+          remoteMeta = { updatedAt: Number(resp2?.meta?.updatedAt || 0) };
+          saveCache(listaItems, remoteMeta);
+          render();
+          setSync("ok", "Listo ✅");
+          toast("Conectado ✅", "ok", "Cuenta autorizada.");
+        }
+      } catch {
+        // si cancela, queda en modo offline
+      }
+      return;
+    }
+
     const remoteItems = Array.isArray(resp?.items) ? resp.items : [];
     const meta = resp?.meta || { updatedAt: 0 };
 
