@@ -293,6 +293,20 @@ const toastRoot = document.getElementById("toast-root");
 let listaItems = [];
 let remoteMeta = { updatedAt: 0 };
 
+async function waitRemoteUpdate(prevUpdatedAt, timeoutMs = 2500) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const r = await apiGetJSONP("get");
+      const ua = Number(r?.meta?.updatedAt || 0);
+      if (r?.ok === true && ua > Number(prevUpdatedAt || 0)) return r;
+    } catch { }
+    await new Promise(res => setTimeout(res, 250));
+  }
+  return null;
+}
+
+
 // Control de cambios locales (evita pisadas por GET de verificación)
 let localVersion = 0;
 
@@ -466,7 +480,7 @@ async function apiGetJSONP(action) {
 
 // POST no-cors (sin token)
 async function apiSet(items) {
-  const token = await ensureOAuthToken(true, "select_account");
+  const token = await ensureOAuthToken(true, "consent");
   const url = `${API_BASE}?action=set`;
   await fetch(url, {
     method: "POST",
@@ -595,12 +609,27 @@ function scheduleSave(reason = "") {
         }
       }
 
+      const prevUA = Number(remoteMeta?.updatedAt || 0);
+
       await apiSet(listaItems);
       setPending(listaItems);
 
-      const resp = await apiGetJSONP("get");
-      const remoteItems = Array.isArray(resp?.items) ? resp.items : [];
-      const meta = resp?.meta || { updatedAt: 0 };
+      // ✅ NO confiar en el GET inmediato: esperar a que updatedAt cambie
+      const confirmed = await waitRemoteUpdate(prevUA, 2500);
+
+      if (!confirmed) {
+        // No confirmamos a tiempo: NO pisamos tu lista local con vacío
+        setSync("ok", "Guardado ✅ (verificando)");
+        if (reason) toast("Guardado ✅", "ok", "Pendiente de confirmación del servidor.");
+        saveCache(listaItems, remoteMeta);
+        // NO borro pending acá para reintentar después automáticamente
+        return;
+      }
+
+      const remoteItems = Array.isArray(confirmed?.items) ? confirmed.items : [];
+      const ua = Number(confirmed?.meta?.updatedAt || 0);
+      const meta = { updatedAt: ua };
+
 
       // Si hubo cambios mientras guardábamos, no pisar estado local
       if (localVersion !== startedVersion) {
@@ -655,11 +684,21 @@ async function trySyncPending() {
     listaItems = dedupNormalize(pending.items);
     render();
 
+    const prevUA = Number(remoteMeta?.updatedAt || 0);
+
     await apiSet(listaItems);
 
-    const resp = await apiGetJSONP("get");
-    const remoteItems = Array.isArray(resp?.items) ? resp.items : [];
-    const meta = resp?.meta || { updatedAt: 0 };
+    // ✅ Esperar confirmación del server (updatedAt cambia)
+    const confirmed = await waitRemoteUpdate(prevUA, 2500);
+
+    if (!confirmed) {
+      setSync("ok", "Sincronizado ✅ (verificando)");
+      toast("Sincronizado ✅", "ok", "Pendiente confirmación del servidor.");
+      return;
+    }
+
+    const remoteItems = Array.isArray(confirmed?.items) ? confirmed.items : [];
+    const meta = { updatedAt: Number(confirmed?.meta?.updatedAt || 0) };
 
     listaItems = dedupNormalize(remoteItems);
     remoteMeta = { updatedAt: Number(meta.updatedAt || 0) };
