@@ -44,8 +44,6 @@ function requestAccessToken({ prompt } = {}) {
     }, 45_000);
 
     oauthTokenClient.callback = (resp) => {
-      console.log("GIS resp:", resp);
-
       if (done) return;
       done = true;
       clearTimeout(timer);
@@ -82,31 +80,33 @@ function isTokenValid() {
 
 // Esto intenta silent. Si falla y allowInteractive=true, abre popup.
 async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "consent") {
-  // 0) si ya está en memoria, OK
+  // 1) si ya está en memoria, OK
   if (isTokenValid()) return oauthAccessToken;
 
-  // 0.5) si hay token guardado, cargarlo
-  if (loadStoredOAuth() && isTokenValid()) return oauthAccessToken;
+  // 2) si hay token guardado, cargarlo
+  loadStoredOAuth();
+  if (isTokenValid()) return oauthAccessToken;
 
-  // 1) silent (siempre intentamos, pero puede fallar según navegador)
-  try {
-    const r = await requestAccessToken({ prompt: "none" }); // 👈 importante
+  // 3) Si es interactivo (el usuario tocó), NO intentamos silent primero.
+  if (allowInteractive) {
+    const r = await requestAccessToken({ prompt: interactivePrompt || "select_account consent" });
     oauthAccessToken = r.access_token;
     oauthExpiresAt = Date.now() + (r.expires_in * 1000);
     saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
     return oauthAccessToken;
-  } catch { }
+  }
 
-  // 2) interactivo (solo si el usuario tocó "Conectar")
-  if (!allowInteractive) throw new Error("TOKEN_NEEDS_INTERACTIVE");
-
-  const r = await requestAccessToken({ prompt: interactivePrompt || "consent" });
-  oauthAccessToken = r.access_token;
-  oauthExpiresAt = Date.now() + (r.expires_in * 1000);
-  saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
-  return oauthAccessToken;
+  // 4) Background/silent: intentamos prompt:none (puede fallar en incógnito/Brave)
+  try {
+    const r = await requestAccessToken({ prompt: "none" });
+    oauthAccessToken = r.access_token;
+    oauthExpiresAt = Date.now() + (r.expires_in * 1000);
+    saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
+    return oauthAccessToken;
+  } catch {
+    throw new Error("TOKEN_NEEDS_INTERACTIVE");
+  }
 }
-
 
 // =====================
 // Local cache/offline keys (tareas)
@@ -178,7 +178,7 @@ titulo.appendChild(btnConnect);
 btnConnect.addEventListener("click", async () => {
   try {
     setSync("saving", "Autorizando…");
-    await ensureOAuthToken(true, "select_account");
+    await ensureOAuthToken(true, "select_account consent");
     await refreshFromRemote(true);
     setSync("ok", "Conectado ✅");
     toast("Conectado ✅", "ok", "Ya podés sincronizar con Drive.");
@@ -698,9 +698,14 @@ async function refreshFromRemote(showToast = true) {
     if (resp?.ok === false && (resp?.error === "forbidden" || resp?.error === "auth_required")) {
       setSync("offline", "Cuenta no autorizada");
       toast("Cuenta no autorizada", "err", "Elegí otra cuenta para Conectar.");
+
+      clearStoredOAuth();        // 👈 borra token local (si era de cuenta no permitida)
+      oauthAccessToken = "";     // 👈 por las dudas
+      oauthExpiresAt = 0;
+
       // Fuerza selector de cuenta
       try {
-        await ensureOAuthToken(true, "select_account");
+        await ensureOAuthToken(true, "select_account consent");
         // reintenta una vez ya con otra cuenta
         const resp2 = await apiGetJSONP("get");
         if (resp2?.ok === true) {
