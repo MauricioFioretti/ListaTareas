@@ -44,8 +44,22 @@ function requestAccessToken({ prompt } = {}) {
       done = true;
       clearTimeout(timer);
 
-      if (resp?.error) reject(new Error(resp.error));
-      else resolve(resp);
+      if (resp?.error) {
+        // GIS suele devolver interaction_required cuando pedís silent
+        const err = String(resp.error || "");
+        const sub = String(resp.error_subtype || "");
+        const msg = (err + (sub ? `:${sub}` : "")).toLowerCase();
+
+        if (msg.includes("interaction_required") || msg.includes("access_denied")) {
+          reject(new Error("TOKEN_NEEDS_INTERACTIVE"));
+          return;
+        }
+
+        reject(new Error(err));
+        return;
+      }
+      resolve(resp);
+
     };
 
     // Si prompt viene undefined, NO lo mandamos (GIS a veces se pone pesado si mandás "")
@@ -788,6 +802,17 @@ window.addEventListener("load", async () => {
   await waitGIS();
   initOAuth();
 
+  // Si no hay token (ni guardado ni válido), NO intentes sincronizar en background
+  // (evita "Sincronizando..." infinito por interaction_required)
+  loadStoredOAuth?.(); // si existe la función de token persistente
+
+  if (!isTokenValid()) {
+    setSync("offline", "Necesita Conectar");
+    // Importante: NO salimos del load, dejamos que renderice cache/pending si hay,
+    // pero evitamos el refresh remoto automático.
+  }
+
+
   // Intentar recuperar token guardado (para no pedir permisos en cada refresh)
   loadStoredOAuth();
 
@@ -815,7 +840,13 @@ window.addEventListener("load", async () => {
     return;
   }
 
-  // 3) remoto
-  await refreshFromRemote(false);
-  if (!cached?.items) toast("Lista lista ✅", "ok", "Cargada desde Drive");
+  // 3) remoto (solo si hay token válido)
+  if (isTokenValid()) {
+    await refreshFromRemote(false);
+    if (!cached?.items) toast("Lista lista ✅", "ok", "Cargada desde Drive");
+  } else {
+    // sin token: quedamos en modo offline hasta que toque "Conectar"
+    setSync("offline", "Necesita Conectar");
+  }
+
 });
