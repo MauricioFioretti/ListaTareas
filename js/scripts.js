@@ -5,6 +5,76 @@
 const API_BASE = "https://script.google.com/macros/s/AKfycbzHOg58y2GFbPZijSmMX567cOYvpbZ3PTLbd7qAKwcmu9EyzbuKseIymW9eaG_6Tjfo9w/exec"; // ej: https://script.google.com/macros/s/XXXXX/exec
 
 // =====================
+// CONFIG OAUTH (Google Identity Services)
+// =====================
+// ⚠️ Usá tu OAuth Client ID (tipo "Web application") del Google Cloud Console
+const OAUTH_CLIENT_ID = "PEGAR_CLIENT_ID.apps.googleusercontent.com";
+
+// scope mínimo para identificar al usuario (email)
+const OAUTH_SCOPES = "openid email profile";
+
+let oauthTokenClient = null;
+let oauthAccessToken = "";
+let oauthExpiresAt = 0;
+
+// Inicializa GIS Token Client
+function initOAuth() {
+  oauthTokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: OAUTH_CLIENT_ID,
+    scope: OAUTH_SCOPES,
+    callback: () => { }
+  });
+}
+
+function requestAccessToken({ prompt } = {}) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      reject(new Error("popup_timeout_or_closed"));
+    }, 45_000);
+
+    oauthTokenClient.callback = (resp) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+
+      if (resp?.error) reject(new Error(resp.error));
+      else resolve(resp);
+    };
+
+    oauthTokenClient.requestAccessToken({ prompt: prompt ?? "" });
+  });
+}
+
+function isTokenValid() {
+  return oauthAccessToken && Date.now() < (oauthExpiresAt - 30_000);
+}
+
+// Esto intenta silent. Si falla y allowInteractive=true, abre popup.
+async function ensureOAuthToken(allowInteractive = false) {
+  if (isTokenValid()) return oauthAccessToken;
+
+  // 1) silent
+  try {
+    const r = await requestAccessToken({ prompt: "" });
+    oauthAccessToken = r.access_token;
+    oauthExpiresAt = Date.now() + (r.expires_in * 1000);
+    return oauthAccessToken;
+  } catch { }
+
+  // 2) interactivo (solo en acciones del usuario)
+  if (!allowInteractive) throw new Error("TOKEN_NEEDS_INTERACTIVE");
+
+  const r = await requestAccessToken({ prompt: "consent" });
+  oauthAccessToken = r.access_token;
+  oauthExpiresAt = Date.now() + (r.expires_in * 1000);
+  return oauthAccessToken;
+}
+
+// =====================
 // Local cache/offline keys (tareas)
 // =====================
 const LS_CACHE = "tareas_drive_cache_v1";
@@ -253,9 +323,16 @@ function isOnline() {
 // =====================
 // API: JSONP GET (evita CORS sin token)
 // =====================
-function apiGetJSONP(action) {
+async function apiGetJSONP(action) {
+  // 1) Conseguimos token fuera del Promise (acá sí podemos usar await)
+  const token = await ensureOAuthToken(false).catch(() => "");
+
+  // 2) Luego hacemos el JSONP tradicional
   return new Promise((resolve, reject) => {
     const cbName = "jsonp_cb_" + Date.now() + "_" + Math.floor(Math.random() * 1e6);
+
+    let script = null;
+    let timer = null;
 
     window[cbName] = (data) => {
       cleanup();
@@ -263,21 +340,25 @@ function apiGetJSONP(action) {
     };
 
     const cleanup = () => {
-      try { delete window[cbName]; } catch { }
+      try { delete window[cbName]; } catch {}
       if (script && script.parentNode) script.parentNode.removeChild(script);
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
     };
 
-    const url = `${API_BASE}?action=${encodeURIComponent(action)}&callback=${encodeURIComponent(cbName)}&_=${Date.now()}`;
+    const url =
+      `${API_BASE}?action=${encodeURIComponent(action)}` +
+      `&access_token=${encodeURIComponent(token)}` +
+      `&callback=${encodeURIComponent(cbName)}` +
+      `&_=${Date.now()}`;
 
-    const script = document.createElement("script");
+    script = document.createElement("script");
     script.src = url;
     script.onerror = () => {
       cleanup();
       reject(new Error("JSONP error (URL/deploy)."));
     };
 
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       cleanup();
       reject(new Error("JSONP timeout."));
     }, 12000);
@@ -288,12 +369,13 @@ function apiGetJSONP(action) {
 
 // POST no-cors (sin token)
 async function apiSet(items) {
+  const token = await ensureOAuthToken(true);
   const url = `${API_BASE}?action=set`;
   await fetch(url, {
     method: "POST",
     mode: "no-cors",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify({ items })
+    body: JSON.stringify({ access_token: token, items })
   });
 }
 
@@ -598,6 +680,17 @@ window.addEventListener("offline", () => {
 // =====================
 window.addEventListener("load", async () => {
   input1.focus();
+
+  // Esperar GIS y preparar token client
+  const waitGIS = () => new Promise((res) => {
+    const t = setInterval(() => {
+      if (window.google?.accounts?.oauth2) { clearInterval(t); res(); }
+    }, 80);
+  });
+
+  await waitGIS();
+  initOAuth();
+
 
   // 1) cache instantáneo
   const cached = loadCache();
