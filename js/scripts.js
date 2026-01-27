@@ -16,11 +16,9 @@ const OAUTH_SCOPES = "openid email profile";
 
 async function forceSwitchAccount() {
   // obliga a Google a mostrar el selector de cuenta
-  oauthAccessToken = "";
-  oauthExpiresAt = 0;
+  clearStoredOAuth();              // 👈 borra localStorage + memoria
   await ensureOAuthToken(true, "select_account");
 }
-
 
 let oauthTokenClient = null;
 let oauthAccessToken = "";
@@ -468,7 +466,7 @@ async function apiGetJSONP(action) {
 
 // POST no-cors (sin token)
 async function apiSet(items) {
-  const token = await ensureOAuthToken(true);
+  const token = await ensureOAuthToken(true, "select_account");
   const url = `${API_BASE}?action=set`;
   await fetch(url, {
     method: "POST",
@@ -857,10 +855,6 @@ window.addEventListener("load", async () => {
     // Importante: NO salimos del load, dejamos que renderice cache/pending si hay,
     // pero evitamos el refresh remoto automático.
   }
-
-
-  // Intentar recuperar token guardado (para no pedir permisos en cada refresh)
-  loadStoredOAuth();
 
   // 1) cache instantáneo
   const cached = loadCache();
