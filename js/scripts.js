@@ -10,6 +10,7 @@ const API_BASE = "https://script.google.com/macros/s/AKfycbzHOg58y2GFbPZijSmMX56
 // ⚠️ Usá tu OAuth Client ID (tipo "Web application") del Google Cloud Console
 const OAUTH_CLIENT_ID = "917192108969-6d693ji2l5ku1vsje8s6brvio2j01hio.apps.googleusercontent.com";
 
+
 // scope mínimo para identificar al usuario (email)
 const OAUTH_SCOPES = "openid email profile";
 
@@ -37,6 +38,8 @@ function requestAccessToken({ prompt } = {}) {
     }, 45_000);
 
     oauthTokenClient.callback = (resp) => {
+      console.log("GIS resp:", resp);
+
       if (done) return;
       done = true;
       clearTimeout(timer);
@@ -592,6 +595,7 @@ async function trySyncPending() {
     }
     setSync("offline", "Sincronización pendiente");
   }
+
 }
 
 async function refreshFromRemote(showToast = true) {
