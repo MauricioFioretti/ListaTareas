@@ -474,6 +474,12 @@ async function trySyncPending() {
 }
 
 async function refreshFromRemote(showToast = true) {
+
+  // ✅ Guard: si el usuario cambia algo mientras esperamos el remoto,
+  // NO vamos a pisar la lista local cuando llegue el GET.
+  const startedVersion = localVersion;
+
+
   if (!isOnline()) {
     setSync("offline", "Sin conexión — usando cache");
     return;
@@ -483,12 +489,24 @@ async function refreshFromRemote(showToast = true) {
     const remoteItems = Array.isArray(resp?.items) ? resp.items : [];
     const meta = resp?.meta || { updatedAt: 0 };
 
+    // ✅ Si hubo cambios locales mientras cargaba el remoto, NO pisar la lista.
+    if (localVersion !== startedVersion) {
+      // Igual actualizamos meta para que el cache tenga el updatedAt más nuevo
+      remoteMeta = { updatedAt: Number(meta.updatedAt || 0) };
+      saveCache(listaItems, remoteMeta);
+
+      setSync("ok", "Cambios locales ✅");
+      if (showToast) toast("Cambios locales detectados", "warn", "No se reemplazó tu lista por la versión remota.");
+      return;
+    }
+
     listaItems = dedupNormalize(remoteItems);
     remoteMeta = { updatedAt: Number(meta.updatedAt || 0) };
     saveCache(listaItems, remoteMeta);
     render();
 
     setSync("ok", "Listo ✅");
+
     if (showToast) toast("Lista actualizada", "ok", "Se cargó desde Drive.");
   } catch {
     setSync("offline", "No se pudo cargar — usando cache");
