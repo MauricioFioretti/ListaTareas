@@ -98,6 +98,27 @@ syncPill.className = "sync-pill";
 syncPill.innerHTML = `<span class="sync-dot"></span><span class="sync-text">Cargando…</span>`;
 titulo.appendChild(syncPill);
 
+const btnConnect = document.createElement("button");
+btnConnect.className = "btn-connect";
+btnConnect.textContent = "Conectar";
+btnConnect.style.marginLeft = "10px";
+titulo.appendChild(btnConnect);
+
+btnConnect.addEventListener("click", async () => {
+  try {
+    setSync("saving", "Autorizando…");
+    await ensureOAuthToken(true);
+    await refreshFromRemote(true);
+    setSync("ok", "Conectado ✅");
+    toast("Conectado ✅", "ok", "Ya podés sincronizar con Drive.");
+  } catch (e) {
+    setSync("offline", "No autorizado");
+    toast("No se pudo autorizar", "err", e?.message || "");
+  }
+});
+
+
+
 const main = document.querySelector("main");
 
 const seccionLista = document.createElement("section");
@@ -325,7 +346,14 @@ function isOnline() {
 // =====================
 async function apiGetJSONP(action) {
   // 1) Conseguimos token fuera del Promise (acá sí podemos usar await)
-  const token = await ensureOAuthToken(false).catch(() => "");
+  let token = "";
+  try {
+    token = await ensureOAuthToken(false); // intenta silent si ya hubo consentimiento
+  } catch (e) {
+    // si todavía no hay token, devolvemos un error controlado
+    throw new Error("TOKEN_NEEDS_INTERACTIVE");
+  }
+
 
   // 2) Luego hacemos el JSONP tradicional
   return new Promise((resolve, reject) => {
@@ -340,7 +368,7 @@ async function apiGetJSONP(action) {
     };
 
     const cleanup = () => {
-      try { delete window[cbName]; } catch {}
+      try { delete window[cbName]; } catch { }
       if (script && script.parentNode) script.parentNode.removeChild(script);
       if (timer) clearTimeout(timer);
     };
@@ -509,10 +537,16 @@ function scheduleSave(reason = "") {
       render();
       setSync("ok", "Guardado ✅");
       if (reason) toast("Guardado ✅", "ok", reason);
-    } catch {
+    } catch (e) {
       setPending(listaItems);
-      setSync("offline", "No se pudo guardar — Queda en cola");
-      toast("No se pudo guardar", "err", "Quedó pendiente, se reintenta solo.");
+
+      if ((e?.message || "") === "TOKEN_NEEDS_INTERACTIVE") {
+        setSync("offline", "Necesita Conectar");
+        toast("Necesitás autorizar", "warn", "Tocá el botón Conectar.");
+      } else {
+        setSync("offline", "No se pudo guardar — Queda en cola");
+        toast("No se pudo guardar", "err", e?.message || "Quedó pendiente, se reintenta solo.");
+      }
     } finally {
       saving = false;
     }
@@ -550,7 +584,12 @@ async function trySyncPending() {
     render();
     setSync("ok", "Sincronizado ✅");
     toast("Sincronizado ✅", "ok", "Se aplicaron cambios pendientes.");
-  } catch {
+  } catch (e) {
+    if ((e?.message || "") === "TOKEN_NEEDS_INTERACTIVE") {
+      setSync("offline", "Necesita Conectar");
+      toast("Necesitás autorizar", "warn", "Tocá el botón Conectar.");
+      return;
+    }
     setSync("offline", "Sincronización pendiente");
   }
 }
@@ -590,7 +629,13 @@ async function refreshFromRemote(showToast = true) {
     setSync("ok", "Listo ✅");
 
     if (showToast) toast("Lista actualizada", "ok", "Se cargó desde Drive.");
-  } catch {
+  } catch (e) {
+    if ((e?.message || "") === "TOKEN_NEEDS_INTERACTIVE") {
+      setSync("offline", "Necesita Conectar");
+      if (showToast) toast("Necesitás autorizar", "warn", "Tocá el botón Conectar.");
+      return;
+    }
+
     setSync("offline", "No se pudo cargar — usando cache");
     if (showToast) toast("No se pudo cargar", "warn", "Mostrando la última versión guardada.");
   }
