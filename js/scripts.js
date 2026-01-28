@@ -101,9 +101,10 @@ async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "c
     return oauthAccessToken;
   }
 
-  // 4) Background/silent: intentamos prompt:none (puede fallar en incógnito/Brave)
+  // 4) Background/silent: intentamos prompt:"none" (silent real)
   try {
-    const r = await requestAccessToken({ prompt: "" }); // silent-friendly
+    const r = await requestAccessToken({ prompt: "none" });
+
     oauthAccessToken = r.access_token;
     oauthExpiresAt = Date.now() + (r.expires_in * 1000);
     saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
