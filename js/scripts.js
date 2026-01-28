@@ -33,11 +33,15 @@ function initOAuth() {
     client_id: OAUTH_CLIENT_ID,
     scope: OAUTH_SCOPES,
 
-    // ✅ Importantísimo: evita re-consent cuando ya estaba otorgado
+    // ✅ evita pedir permisos de nuevo si ya fueron otorgados
     include_granted_scopes: true,
+
+    // ✅ clave en browsers con bloqueo de cookies (Brave, etc.)
+    use_fedcm_for_prompt: true,
 
     callback: () => { }
   });
+
 
 }
 
