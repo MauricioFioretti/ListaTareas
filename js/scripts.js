@@ -543,30 +543,55 @@ function isOnline() {
 // =====================
 // API: GET con CORS (sin JSONP)
 // =====================
-async function apiGet(mode) {
-  const token = await ensureOAuthToken(false);
+// =====================
+// API: GET por JSONP (evita CORS de Apps Script)
+// =====================
+function apiGetJsonp(mode) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const token = await ensureOAuthToken(false);
 
-  const url =
-    `${API_BASE}?mode=${encodeURIComponent(mode)}` +
-    `&access_token=${encodeURIComponent(token)}` +
-    `&ts=${Date.now()}`; // cache-bust
+      const cb = "__cb_" + Math.random().toString(36).slice(2);
+      const url =
+        `${API_BASE}?mode=${encodeURIComponent(mode)}` +
+        `&access_token=${encodeURIComponent(token)}` +
+        `&callback=${encodeURIComponent(cb)}` +
+        `&ts=${Date.now()}`;
 
-  const resp = await fetch(url, {
-    method: "GET",
-    mode: "cors",
-    credentials: "omit"
+      const s = document.createElement("script");
+
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error("JSONP_TIMEOUT"));
+      }, 15000);
+
+      function cleanup() {
+        clearTimeout(timer);
+        try { delete window[cb]; } catch {}
+        if (s.parentNode) s.parentNode.removeChild(s);
+      }
+
+      window[cb] = (data) => {
+        cleanup();
+        resolve(data);
+      };
+
+      s.onerror = () => {
+        cleanup();
+        reject(new Error("JSONP_LOAD_ERROR"));
+      };
+
+      s.src = url;
+      document.head.appendChild(s);
+    } catch (e) {
+      reject(e);
+    }
   });
+}
 
-  const text = await resp.text();
-
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new Error("BAD_JSON_RESPONSE");
-  }
-
-  return data;
+async function apiGet(mode) {
+  // Ahora GET usa JSONP (sin CORS)
+  return await apiGetJsonp(mode);
 }
 
 async function apiPost(items) {
@@ -603,25 +628,18 @@ async function verifyBackendAccessOrThrow() {
 async function apiSet(items) {
   const token = await ensureOAuthToken(false);
 
-  const resp = await fetch(API_BASE, {
+  // POST a Apps Script: lo hacemos "fire-and-forget"
+  // porque leer respuesta dispara CORS.
+  await fetch(API_BASE, {
     method: "POST",
-    headers: { "Content-Type": "text/plain;charset=utf-8" }, // sin preflight
+    mode: "no-cors", // 👈 clave
+    headers: { "Content-Type": "text/plain;charset=utf-8" }, // evita preflight
     body: JSON.stringify({ access_token: token, items })
   });
 
-  const data = await resp.json().catch(() => null);
-
-  // si el backend avisa auth/forbidden, lo propagamos
-  if (data?.ok === false) {
-    const err = String(data?.error || "unknown_error");
-    if (err === "auth_required") throw new Error("TOKEN_NEEDS_INTERACTIVE");
-    throw new Error("BACKEND_ERROR:" + err);
-  }
-
-
-  return data;
+  // No podemos leer JSON (opaque), confirmamos con GET JSONP luego.
+  return { ok: true };
 }
-
 
 // =====================
 // Render
