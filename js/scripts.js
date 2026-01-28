@@ -32,8 +32,13 @@ function initOAuth() {
   oauthTokenClient = google.accounts.oauth2.initTokenClient({
     client_id: OAUTH_CLIENT_ID,
     scope: OAUTH_SCOPES,
+
+    // ✅ Importantísimo: evita re-consent cuando ya estaba otorgado
+    include_granted_scopes: true,
+
     callback: () => { }
   });
+
 }
 
 function requestAccessToken({ prompt, hint } = {}) {
@@ -91,14 +96,18 @@ async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "c
   loadStoredOAuth();
   if (isTokenValid()) return oauthAccessToken;
 
-  // 3) Silent refresh (siempre primero: estilo Drive Gigante)
+  // 3) Refresh "permisivo" tipo Drive XL:
+  // - si Google puede autorizar sin preguntar: se cierra solo
+  // - si NO puede: puede mostrar chooser (limitación del navegador/cookies)
   try {
     const hintEmail = loadStoredOAuthEmail();
-    console.log("[ensureOAuthToken] silent refresh, hint =", hintEmail);
+    console.log("[ensureOAuthToken] refresh permissive, hint =", hintEmail);
 
-    // prompt undefined => NO se envía (más permisivo que "none")
     const r = await requestAccessToken({
+      // ✅ NO mandamos prompt (permite auto-approve si hay sesión)
       prompt: undefined,
+
+      // ✅ clave para evitar chooser cuando se puede
       hint: hintEmail
     });
 
@@ -109,8 +118,7 @@ async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "c
       return oauthAccessToken;
     }
   } catch (e) {
-    console.warn("[ensureOAuthToken] silent failed:", e?.message || e);
-    // seguimos abajo si allowInteractive = true
+    console.warn("[ensureOAuthToken] permissive refresh failed:", e?.message || e);
   }
 
   // 4) Si el llamado fue interactivo (click del usuario), recién ahí popup
@@ -1035,6 +1043,41 @@ window.addEventListener("load", async () => {
     // sin token: quedamos en modo offline hasta que toque "Conectar"
     setSync("offline", "Necesita Conectar");
   }
+
+  // =====================
+  // Auto-refresh proactivo del token (estilo "sesión infinita")
+  // =====================
+  let tokenRefreshTimer = null;
+
+  function startTokenAutoRefresh() {
+    if (tokenRefreshTimer) clearInterval(tokenRefreshTimer);
+
+    tokenRefreshTimer = setInterval(async () => {
+      try {
+        // Solo intentar si hay algo que refrescar
+        if (!oauthAccessToken) return;
+
+        // Solo si la pestaña está visible (reduce chance de bloqueos)
+        if (document.visibilityState !== "visible") return;
+
+        // Si falta menos de 2 minutos, refrescar
+        const msLeft = oauthExpiresAt - Date.now();
+        if (msLeft > 120_000) return;
+
+        console.log("[token] proactive refresh, msLeft:", msLeft);
+
+        // Refresh permisivo (puede abrir popup "espera un momento..." y cerrarse solo)
+        await ensureOAuthToken(false);
+
+      } catch (e) {
+        // Si no pudo, NO forzamos nada acá. Se verá como "Necesita Conectar" cuando toque API.
+        console.warn("[token] proactive refresh failed:", e?.message || e);
+      }
+    }, 20_000); // chequea cada 20s
+  }
+
+  // arrancar auto refresh
+  startTokenAutoRefresh();
 
   // DEBUG: forzar expiración para probar refresh silencioso
   window.__expireTokenNow = () => {
