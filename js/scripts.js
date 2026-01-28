@@ -289,13 +289,6 @@ btnConnect.addEventListener("click", async () => {
   } catch (e) {
     const msg = String(e?.message || "");
 
-    if (msg === "NOT_AUTHORIZED") {
-      setSync("offline", "Cuenta no autorizada");
-      setAccountUI(""); // vuelve a modo Conectar
-      toast("Cuenta no autorizada", "err", "Tocá Conectar y elegí otra cuenta.");
-      return;
-    }
-
     if (msg === "TOKEN_NEEDS_INTERACTIVE") {
       setSync("offline", "Necesita Conectar");
       setAccountUI(""); // vuelve a modo Conectar
@@ -592,17 +585,15 @@ async function verifyBackendAccessOrThrow() {
 
   if (r?.ok !== true) {
     const err = String(r?.error || "unknown_error");
-    if (err === "forbidden") {
-      // cuenta no permitida -> sí limpiamos
-      clearStoredOAuth();
-      // UI también vuelve a modo conectar
-      setAccountUI("");
-      throw new Error("NOT_AUTHORIZED");
-    }
     if (err === "auth_required") {
-      // token vencido / no válido -> NO limpies (solo pedí reconectar)
       throw new Error("TOKEN_NEEDS_INTERACTIVE");
     }
+    if (err === "wrong_audience") {
+      // token válido, pero NO emitido para tu OAuth Client ID
+      clearStoredOAuth();
+      throw new Error("TOKEN_NEEDS_INTERACTIVE");
+    }
+
     throw new Error("BACKEND_ERROR:" + err);
   }
   return r;
@@ -623,10 +614,10 @@ async function apiSet(items) {
   // si el backend avisa auth/forbidden, lo propagamos
   if (data?.ok === false) {
     const err = String(data?.error || "unknown_error");
-    if (err === "forbidden") throw new Error("NOT_AUTHORIZED");
     if (err === "auth_required") throw new Error("TOKEN_NEEDS_INTERACTIVE");
     throw new Error("BACKEND_ERROR:" + err);
   }
+
 
   return data;
 }
@@ -739,17 +730,13 @@ function scheduleSave(reason = "") {
       try {
         const check = await apiGet("get");
         if (check?.ok === false) {
-          if (check?.error === "forbidden") {
-            setSync("offline", "Cuenta no autorizada");
-            toast("Cuenta no autorizada", "err", "Tocá Conectar y elegí otra cuenta.");
-            return;
-          }
           if (check?.error === "auth_required") {
             setSync("offline", "Necesita Conectar");
             toast("Necesitás autorizar", "warn", "Tocá el botón Conectar.");
             return;
           }
         }
+
       } catch (e) {
         if ((e?.message || "") === "TOKEN_NEEDS_INTERACTIVE") {
           setSync("offline", "Necesita Conectar");
@@ -882,13 +869,6 @@ async function refreshFromRemote(showToast = true) {
 
     if (resp?.ok !== true) {
       const err = String(resp?.error || "");
-
-      if (err === "forbidden") {
-        setSync("offline", "Cuenta no autorizada");
-        toast("Cuenta no autorizada", "err", "Tocá Conectar y elegí otra cuenta.");
-        clearStoredOAuth(); // solo en forbidden
-        return;
-      }
 
       if (err === "auth_required") {
         setSync("offline", "Necesita Conectar");
