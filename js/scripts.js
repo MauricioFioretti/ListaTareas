@@ -418,7 +418,7 @@ async function waitRemoteUpdate(prevUpdatedAt, timeoutMs = 2500) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {
-      const r = await apiGet("get");
+      const r = await apiGet("list");
       const ua = Number(r?.meta?.updatedAt || 0);
       if (r?.ok === true && ua > Number(prevUpdatedAt || 0)) return r;
     } catch { }
@@ -582,17 +582,16 @@ function jsonp(url, timeoutMs = 15000) {
 }
 
 async function apiGet(mode) {
-  let token = "";
-  try {
-    token = await ensureOAuthToken(false);
-  } catch (e) {
-    if ((e?.message || "") === "TOKEN_NEEDS_INTERACTIVE") throw e;
-    throw e;
-  }
-  const url = `${API_BASE}?mode=${encodeURIComponent(mode)}&access_token=${encodeURIComponent(token)}`;
-  const r = await fetch(url);
-  return await r.json();
+  const token = await ensureOAuthToken(false);
+
+  // JSONP para evitar CORS desde GitHub Pages (igual que Drive XL)
+  const url =
+    `${API_BASE}?mode=${encodeURIComponent(mode)}` +
+    `&access_token=${encodeURIComponent(token)}`;
+
+  return await jsonp(url, 15000);
 }
+
 
 async function apiPost(items) {
   const token = await ensureOAuthToken(false);
@@ -605,7 +604,7 @@ async function apiPost(items) {
 }
 
 async function verifyBackendAccessOrThrow() {
-  const r = await apiGet("get");
+  const r = await apiGet("list");
   console.log("VERIFY:", r);
 
   if (r?.ok !== true) {
@@ -745,7 +744,7 @@ function scheduleSave(reason = "") {
 
       // Verificación rápida de cuenta/autorización antes de intentar guardar
       try {
-        const check = await apiGet("get");
+        const check = await apiGet("list");
         if (check?.ok === false) {
           if (check?.error === "forbidden") {
             setSync("offline", "Cuenta no autorizada");
@@ -885,7 +884,7 @@ async function refreshFromRemote(showToast = true) {
   }
 
   try {
-    const resp = await apiGet("get");
+    const resp = await apiGet("list");
     console.log("RESP BACKEND:", resp);
 
     if (resp?.ok !== true) {
