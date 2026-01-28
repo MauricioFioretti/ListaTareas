@@ -92,7 +92,9 @@ async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "c
 
   // 3) Si es interactivo (el usuario tocó), NO intentamos silent primero.
   if (allowInteractive) {
-    const r = await requestAccessToken({ prompt: interactivePrompt || "select_account consent" });
+    // Si el usuario tocó "Conectar", ahí sí le podés pasar "select_account consent"
+    const r = await requestAccessToken({ prompt: interactivePrompt ?? "" });
+
     oauthAccessToken = r.access_token;
     oauthExpiresAt = Date.now() + (r.expires_in * 1000);
     saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
@@ -101,7 +103,7 @@ async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "c
 
   // 4) Background/silent: intentamos prompt:none (puede fallar en incógnito/Brave)
   try {
-    const r = await requestAccessToken({ prompt: "none" });
+    const r = await requestAccessToken({ prompt: "" }); // silent-friendly
     oauthAccessToken = r.access_token;
     oauthExpiresAt = Date.now() + (r.expires_in * 1000);
     saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
@@ -505,14 +507,11 @@ function jsonp(url, timeoutMs = 15000) {
   });
 }
 
-
 async function apiGet(action) {
   const token = await ensureOAuthToken(false);
   const url = `${API_BASE}?action=${encodeURIComponent(action)}&access_token=${encodeURIComponent(token)}`;
   return await jsonp(url);
 }
-
-
 
 async function verifyBackendAccessOrThrow() {
   const r = await apiGet("get");
@@ -520,31 +519,32 @@ async function verifyBackendAccessOrThrow() {
 
   if (r?.ok !== true) {
     const err = String(r?.error || "unknown_error");
-    if (err === "forbidden" || err === "auth_required") {
+    if (err === "forbidden") {
       clearStoredOAuth();
       throw new Error("NOT_AUTHORIZED");
+    }
+    if (err === "auth_required") {
+      clearStoredOAuth();
+      throw new Error("TOKEN_NEEDS_INTERACTIVE");
     }
     throw new Error("BACKEND_ERROR:" + err);
   }
   return r;
 }
 
-
 // POST no-cors (sin token)
 async function apiSet(items) {
-  const token = await ensureOAuthToken(true, "consent");
-  const url = `${API_BASE}?action=set`;
+  // NO interactivo acá (autosave)
+  const token = await ensureOAuthToken(false);
 
+  const url = `${API_BASE}?action=set`;
   await fetch(url, {
     method: "POST",
     mode: "no-cors",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
     body: JSON.stringify({ access_token: token, items })
   });
-
-  // En no-cors NO podés leer res.json() (queda “opaque”), y está perfecto.
 }
-
 
 // =====================
 // Render
