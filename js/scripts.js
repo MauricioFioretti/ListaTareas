@@ -12,7 +12,10 @@ const OAUTH_CLIENT_ID = "917192108969-6d693ji2l5ku1vsje8s6brvio2j01hio.apps.goog
 
 
 // scope mínimo para identificar al usuario (email)
-const OAUTH_SCOPES = "openid email profile";
+const OAUTH_SCOPES =
+  "openid email profile " +
+  "https://www.googleapis.com/auth/userinfo.email " +
+  "https://www.googleapis.com/auth/userinfo.profile";
 
 async function forceSwitchAccount() {
   // obliga a Google a mostrar el selector de cuenta
@@ -178,15 +181,57 @@ titulo.appendChild(btnConnect);
 btnConnect.addEventListener("click", async () => {
   try {
     setSync("saving", "Autorizando…");
+
+    // 1) Pedimos token con selector (puede ser cualquier cuenta)
     await ensureOAuthToken(true, "select_account consent");
-    await refreshFromRemote(true);
+
+    // 2) VALIDAMOS contra backend (allowlist real)
+    const r = await verifyBackendAccessOrThrow();
+
+    // DEBUG: verificar qué email está viendo el backend
+    try {
+      const who = await apiGet("whoami");
+      if (who?.ok === true) {
+        toast("Backend ve tu cuenta ✅", "ok", `Email: ${who.email}`);
+      } else {
+        toast("Backend no reconoce la cuenta", "warn", `${who?.error || "unknown"}${who?.email ? " (" + who.email + ")" : ""}`);
+      }
+    } catch { }
+
+
+    // 3) Si ok:true, cargamos items
+    const items = Array.isArray(r.items) ? r.items : [];
+    const ua = Number(r?.meta?.updatedAt || 0);
+
+    listaItems = dedupNormalize(items);
+    remoteMeta = { updatedAt: ua };
+    saveCache(listaItems, remoteMeta);
+    render();
+
     setSync("ok", "Conectado ✅");
-    toast("Conectado ✅", "ok", "Ya podés sincronizar con Drive.");
+    toast("Conectado ✅", "ok", "Cuenta autorizada.");
   } catch (e) {
+    const msg = String(e?.message || "");
+
+    if (msg === "NOT_AUTHORIZED") {
+      setSync("offline", "Cuenta no autorizada");
+      toast("Cuenta no autorizada", "err", "Tocá Conectar y elegí otra cuenta.");
+      // opcional: forzar selector de cuenta inmediatamente
+      // await forceSwitchAccount();
+      return;
+    }
+
+    if (msg === "TOKEN_NEEDS_INTERACTIVE") {
+      setSync("offline", "Necesita Conectar");
+      toast("Necesitás autorizar", "warn", "Tocá Conectar.");
+      return;
+    }
+
     setSync("offline", "No autorizado");
-    toast("No se pudo autorizar", "err", e?.message || "");
+    toast("No se pudo conectar", "err", msg);
   }
 });
+
 
 const main = document.querySelector("main");
 
@@ -297,7 +342,7 @@ async function waitRemoteUpdate(prevUpdatedAt, timeoutMs = 2500) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {
-      const r = await apiGetJSONP("get");
+      const r = await apiGet("get");
       const ua = Number(r?.meta?.updatedAt || 0);
       if (r?.ok === true && ua > Number(prevUpdatedAt || 0)) return r;
     } catch { }
@@ -427,68 +472,79 @@ function isOnline() {
 // =====================
 // API: JSONP GET (evita CORS sin token)
 // =====================
-async function apiGetJSONP(action) {
-  // 1) Conseguimos token fuera del Promise (acá sí podemos usar await)
-  let token = "";
-  try {
-    token = await ensureOAuthToken(false); // intenta silent si ya hubo consentimiento
-  } catch (e) {
-    // si todavía no hay token, devolvemos un error controlado
-    throw new Error("TOKEN_NEEDS_INTERACTIVE");
-  }
 
-
-  // 2) Luego hacemos el JSONP tradicional
+function jsonp(url, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
-    const cbName = "jsonp_cb_" + Date.now() + "_" + Math.floor(Math.random() * 1e6);
+    const cbName = "__cb_" + Math.random().toString(36).slice(2);
+    const script = document.createElement("script");
+    const sep = url.includes("?") ? "&" : "?";
+    script.src = `${url}${sep}callback=${cbName}`;
 
-    let script = null;
-    let timer = null;
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("JSONP_TIMEOUT"));
+    }, timeoutMs);
+
+    function cleanup() {
+      clearTimeout(timer);
+      delete window[cbName];
+      script.remove();
+    }
 
     window[cbName] = (data) => {
       cleanup();
       resolve(data);
     };
 
-    const cleanup = () => {
-      try { delete window[cbName]; } catch { }
-      if (script && script.parentNode) script.parentNode.removeChild(script);
-      if (timer) clearTimeout(timer);
-    };
-
-    const url =
-      `${API_BASE}?action=${encodeURIComponent(action)}` +
-      `&access_token=${encodeURIComponent(token)}` +
-      `&callback=${encodeURIComponent(cbName)}` +
-      `&_=${Date.now()}`;
-
-    script = document.createElement("script");
-    script.src = url;
     script.onerror = () => {
       cleanup();
-      reject(new Error("JSONP error (URL/deploy)."));
+      reject(new Error("JSONP_LOAD_ERROR"));
     };
 
-    timer = setTimeout(() => {
-      cleanup();
-      reject(new Error("JSONP timeout."));
-    }, 12000);
-
-    document.body.appendChild(script);
+    document.head.appendChild(script);
   });
 }
+
+
+async function apiGet(action) {
+  const token = await ensureOAuthToken(false);
+  const url = `${API_BASE}?action=${encodeURIComponent(action)}&access_token=${encodeURIComponent(token)}`;
+  return await jsonp(url);
+}
+
+
+
+async function verifyBackendAccessOrThrow() {
+  const r = await apiGet("get");
+  console.log("VERIFY:", r);
+
+  if (r?.ok !== true) {
+    const err = String(r?.error || "unknown_error");
+    if (err === "forbidden" || err === "auth_required") {
+      clearStoredOAuth();
+      throw new Error("NOT_AUTHORIZED");
+    }
+    throw new Error("BACKEND_ERROR:" + err);
+  }
+  return r;
+}
+
 
 // POST no-cors (sin token)
 async function apiSet(items) {
   const token = await ensureOAuthToken(true, "consent");
   const url = `${API_BASE}?action=set`;
+
   await fetch(url, {
     method: "POST",
     mode: "no-cors",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
     body: JSON.stringify({ access_token: token, items })
   });
+
+  // En no-cors NO podés leer res.json() (queda “opaque”), y está perfecto.
 }
+
 
 // =====================
 // Render
@@ -595,7 +651,7 @@ function scheduleSave(reason = "") {
 
       // Verificación rápida de cuenta/autorización antes de intentar guardar
       try {
-        const check = await apiGetJSONP("get");
+        const check = await apiGet("get");
         if (check?.ok === false && (check?.error === "forbidden" || check?.error === "auth_required")) {
           setSync("offline", "Cuenta no autorizada");
           toast("Cuenta no autorizada", "err", "Tocá Conectar y elegí otra cuenta.");
@@ -720,18 +776,30 @@ async function trySyncPending() {
 }
 
 async function refreshFromRemote(showToast = true) {
-
-  // ✅ Guard: si el usuario cambia algo mientras esperamos el remoto,
-  // NO vamos a pisar la lista local cuando llegue el GET.
   const startedVersion = localVersion;
-
 
   if (!isOnline()) {
     setSync("offline", "Sin conexión — usando cache");
     return;
   }
+
   try {
-    const resp = await apiGetJSONP("get");
+    const resp = await apiGet("get");
+    console.log("RESP BACKEND:", resp);
+
+    if (resp?.ok !== true) {
+      const err = String(resp?.error || "");
+      if (err === "forbidden" || err === "auth_required") {
+        setSync("offline", "Cuenta no autorizada");
+        toast("Cuenta no autorizada", "err", "Tocá Conectar y elegí otra cuenta.");
+        clearStoredOAuth();
+        return;
+      }
+      setSync("offline", "Error backend");
+      toast("Error backend", "err", err || "unknown");
+      return;
+    }
+
 
     // Backend auth handling
     if (resp?.ok === false && (resp?.error === "forbidden" || resp?.error === "auth_required")) {
@@ -746,7 +814,7 @@ async function refreshFromRemote(showToast = true) {
       try {
         await ensureOAuthToken(true, "select_account consent");
         // reintenta una vez ya con otra cuenta
-        const resp2 = await apiGetJSONP("get");
+        const resp2 = await apiGet("get");
         if (resp2?.ok === true) {
           listaItems = dedupNormalize(Array.isArray(resp2.items) ? resp2.items : []);
           remoteMeta = { updatedAt: Number(resp2?.meta?.updatedAt || 0) };
