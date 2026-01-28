@@ -219,30 +219,61 @@ btnConnect.textContent = "Conectar";
 btnConnect.style.marginLeft = "10px";
 titulo.appendChild(btnConnect);
 
+// --- UI cuenta (estilo Drive XL) ---
+const accountPill = document.createElement("div");
+accountPill.className = "account-pill";
+accountPill.style.marginLeft = "10px";
+accountPill.style.opacity = "0.9";
+accountPill.style.fontSize = "13px";
+accountPill.textContent = ""; // acá va el email
+titulo.appendChild(accountPill);
+
+function setAccountUI(email) {
+  const e = (email || "").trim();
+  if (e) {
+    accountPill.textContent = e;
+    btnConnect.textContent = "Cambiar cuenta";
+    btnConnect.dataset.mode = "switch";
+  } else {
+    accountPill.textContent = "";
+    btnConnect.textContent = "Conectar";
+    btnConnect.dataset.mode = "connect";
+  }
+}
+
+
 btnConnect.addEventListener("click", async () => {
   try {
     setSync("saving", "Autorizando…");
 
-    // 1) Pedimos token con selector (puede ser cualquier cuenta)
-    await ensureOAuthToken(true, "consent");
+    // Drive XL behavior:
+    // - Si ya estás conectado y tocás el botón -> forzá selector de cuenta
+    // - Si no -> conectá normal
+    const isSwitch = (btnConnect.dataset.mode === "switch");
+    if (isSwitch) {
+      await forceSwitchAccount(); // limpia y abre selector (select_account)
+    } else {
+      await ensureOAuthToken(true, "consent");
+    }
 
     // 2) VALIDAMOS contra backend (allowlist real)
     const r = await verifyBackendAccessOrThrow();
 
-    // DEBUG: verificar qué email está viendo el backend
+    // 3) whoami (para mostrar email y guardar hint)
     try {
       const who = await apiGet("whoami");
-      if (who?.ok === true) {
+      if (who?.ok === true && who.email) {
         saveStoredOAuthEmail(who.email);
+        setAccountUI(who.email);
         console.log("Email guardado para hint:", who.email);
-        toast("Backend ve tu cuenta ✅", "ok", `Email: ${who.email}`);
       } else {
-        toast("Backend no reconoce la cuenta", "warn", `${who?.error || "unknown"}${who?.email ? " (" + who.email + ")" : ""}`);
+        setAccountUI(loadStoredOAuthEmail());
       }
-    } catch { }
+    } catch {
+      setAccountUI(loadStoredOAuthEmail());
+    }
 
-
-    // 3) Si ok:true, cargamos items
+    // 4) Si ok:true, cargamos items
     const items = Array.isArray(r.items) ? r.items : [];
     const ua = Number(r?.meta?.updatedAt || 0);
 
@@ -258,22 +289,24 @@ btnConnect.addEventListener("click", async () => {
 
     if (msg === "NOT_AUTHORIZED") {
       setSync("offline", "Cuenta no autorizada");
+      setAccountUI(""); // vuelve a modo Conectar
       toast("Cuenta no autorizada", "err", "Tocá Conectar y elegí otra cuenta.");
-      // opcional: forzar selector de cuenta inmediatamente
-      // await forceSwitchAccount();
       return;
     }
 
     if (msg === "TOKEN_NEEDS_INTERACTIVE") {
       setSync("offline", "Necesita Conectar");
+      setAccountUI(""); // vuelve a modo Conectar
       toast("Necesitás autorizar", "warn", "Tocá Conectar.");
       return;
     }
 
     setSync("offline", "No autorizado");
+    setAccountUI("");
     toast("No se pudo conectar", "err", msg);
   }
 });
+
 
 
 const main = document.querySelector("main");
@@ -548,20 +581,28 @@ function jsonp(url, timeoutMs = 15000) {
   });
 }
 
-async function apiGet(action) {
-  console.log("[apiGet] isTokenValid before:", isTokenValid(), "expiresIn(ms):", (oauthExpiresAt - Date.now()));
+async function apiGet(mode) {
+  let token = "";
   try {
-    const token = await ensureOAuthToken(false);
-    const url = `${API_BASE}?action=${encodeURIComponent(action)}&access_token=${encodeURIComponent(token)}`;
-    return await jsonp(url);
+    token = await ensureOAuthToken(false);
   } catch (e) {
-    const msg = String(e?.message || e || "");
-    if (msg === "TOKEN_NEEDS_INTERACTIVE") throw e;
-    // cualquier otro error lo propagamos igual
+    if ((e?.message || "") === "TOKEN_NEEDS_INTERACTIVE") throw e;
     throw e;
   }
+  const url = `${API_BASE}?mode=${encodeURIComponent(mode)}&access_token=${encodeURIComponent(token)}`;
+  const r = await fetch(url);
+  return await r.json();
 }
 
+async function apiPost(items) {
+  const token = await ensureOAuthToken(false);
+  const r = await fetch(API_BASE, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" }, // evita preflight
+    body: JSON.stringify({ access_token: token, items })
+  });
+  return await r.json();
+}
 
 async function verifyBackendAccessOrThrow() {
   const r = await apiGet("get");
@@ -572,6 +613,8 @@ async function verifyBackendAccessOrThrow() {
     if (err === "forbidden") {
       // cuenta no permitida -> sí limpiamos
       clearStoredOAuth();
+      // UI también vuelve a modo conectar
+      setAccountUI("");
       throw new Error("NOT_AUTHORIZED");
     }
     if (err === "auth_required") {
@@ -1009,6 +1052,10 @@ window.addEventListener("load", async () => {
   // (evita "Sincronizando..." infinito por interaction_required)
   loadStoredOAuth?.(); // si existe la función de token persistente
 
+  // UI: si tenías email guardado, mostrálalo como en Drive XL
+  setAccountUI(loadStoredOAuthEmail());
+
+
   if (!isTokenValid()) {
     setSync("offline", "Necesita Conectar");
     // Importante: NO salimos del load, dejamos que renderice cache/pending si hay,
@@ -1041,6 +1088,12 @@ window.addEventListener("load", async () => {
 
   // 3) remoto (solo si hay token válido)
   if (isTokenValid()) {
+    // UI conectado (si tenés email guardado)
+    const em = loadStoredOAuthEmail();
+    if (em) {
+      setAccountUI(em);
+      setSync("ok", "Conectado ✅");
+    }
     await refreshFromRemote(false);
     if (!cached?.items) toast("Lista lista ✅", "ok", "Cargada desde Drive");
   } else {
