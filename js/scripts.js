@@ -253,8 +253,10 @@ btnConnect.addEventListener("click", async () => {
     if (isSwitch) {
       await forceSwitchAccount(); // limpia y abre selector (select_account)
     } else {
-      await ensureOAuthToken(true, "consent");
+      // SIEMPRE mostrar selector para evitar quedar pegado a la última cuenta (no autorizada)
+      await ensureOAuthToken(true, "select_account");
     }
+
 
     // 2) VALIDAMOS contra backend (allowlist real)
     const r = await verifyBackendAccessOrThrow();
@@ -418,7 +420,7 @@ async function waitRemoteUpdate(prevUpdatedAt, timeoutMs = 2500) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {
-      const r = await apiGet("list");
+      const r = await apiGet("get");
       const ua = Number(r?.meta?.updatedAt || 0);
       if (r?.ok === true && ua > Number(prevUpdatedAt || 0)) return r;
     } catch { }
@@ -546,52 +548,33 @@ function isOnline() {
 }
 
 // =====================
-// API: JSONP GET (evita CORS sin token)
+// API: GET con CORS (sin JSONP)
 // =====================
-
-function jsonp(url, timeoutMs = 15000) {
-  return new Promise((resolve, reject) => {
-    const cbName = "__cb_" + Math.random().toString(36).slice(2);
-    const script = document.createElement("script");
-    const sep = url.includes("?") ? "&" : "?";
-    script.src = `${url}${sep}callback=${cbName}`;
-
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(new Error("JSONP_TIMEOUT"));
-    }, timeoutMs);
-
-    function cleanup() {
-      clearTimeout(timer);
-      delete window[cbName];
-      script.remove();
-    }
-
-    window[cbName] = (data) => {
-      cleanup();
-      resolve(data);
-    };
-
-    script.onerror = () => {
-      cleanup();
-      reject(new Error("JSONP_LOAD_ERROR"));
-    };
-
-    document.head.appendChild(script);
-  });
-}
-
 async function apiGet(mode) {
   const token = await ensureOAuthToken(false);
 
-  // JSONP para evitar CORS desde GitHub Pages (igual que Drive XL)
   const url =
     `${API_BASE}?mode=${encodeURIComponent(mode)}` +
-    `&access_token=${encodeURIComponent(token)}`;
+    `&access_token=${encodeURIComponent(token)}` +
+    `&ts=${Date.now()}`; // cache-bust
 
-  return await jsonp(url, 15000);
+  const resp = await fetch(url, {
+    method: "GET",
+    mode: "cors",
+    credentials: "omit"
+  });
+
+  const text = await resp.text();
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error("BAD_JSON_RESPONSE");
+  }
+
+  return data;
 }
-
 
 async function apiPost(items) {
   const token = await ensureOAuthToken(false);
@@ -604,7 +587,7 @@ async function apiPost(items) {
 }
 
 async function verifyBackendAccessOrThrow() {
-  const r = await apiGet("list");
+  const r = await apiGet("get");
   console.log("VERIFY:", r);
 
   if (r?.ok !== true) {
@@ -627,17 +610,27 @@ async function verifyBackendAccessOrThrow() {
 
 // POST no-cors (sin token)
 async function apiSet(items) {
-  // NO interactivo acá (autosave)
   const token = await ensureOAuthToken(false);
 
-  const url = `${API_BASE}?action=set`;
-  await fetch(url, {
+  const resp = await fetch(API_BASE, {
     method: "POST",
-    mode: "no-cors",
-    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    headers: { "Content-Type": "text/plain;charset=utf-8" }, // sin preflight
     body: JSON.stringify({ access_token: token, items })
   });
+
+  const data = await resp.json().catch(() => null);
+
+  // si el backend avisa auth/forbidden, lo propagamos
+  if (data?.ok === false) {
+    const err = String(data?.error || "unknown_error");
+    if (err === "forbidden") throw new Error("NOT_AUTHORIZED");
+    if (err === "auth_required") throw new Error("TOKEN_NEEDS_INTERACTIVE");
+    throw new Error("BACKEND_ERROR:" + err);
+  }
+
+  return data;
 }
+
 
 // =====================
 // Render
@@ -744,7 +737,7 @@ function scheduleSave(reason = "") {
 
       // Verificación rápida de cuenta/autorización antes de intentar guardar
       try {
-        const check = await apiGet("list");
+        const check = await apiGet("get");
         if (check?.ok === false) {
           if (check?.error === "forbidden") {
             setSync("offline", "Cuenta no autorizada");
@@ -884,7 +877,7 @@ async function refreshFromRemote(showToast = true) {
   }
 
   try {
-    const resp = await apiGet("list");
+    const resp = await apiGet("get");
     console.log("RESP BACKEND:", resp);
 
     if (resp?.ok !== true) {
