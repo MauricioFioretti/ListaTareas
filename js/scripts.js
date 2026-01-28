@@ -36,7 +36,7 @@ function initOAuth() {
   });
 }
 
-function requestAccessToken({ prompt } = {}) {
+function requestAccessToken({ prompt, hint } = {}) {
   return new Promise((resolve, reject) => {
     let done = false;
 
@@ -72,8 +72,8 @@ function requestAccessToken({ prompt } = {}) {
     // Si prompt viene undefined, NO lo mandamos (GIS a veces se pone pesado si mandás "")
     const opts = {};
     if (prompt !== undefined) opts.prompt = prompt;
+    if (hint && hint.includes("@")) opts.hint = hint;
     oauthTokenClient.requestAccessToken(opts);
-
   });
 }
 
@@ -82,6 +82,7 @@ function isTokenValid() {
 }
 
 // Esto intenta silent. Si falla y allowInteractive=true, abre popup.
+// Esto intenta silent SIEMPRE primero. Si falla y allowInteractive=true, abre popup.
 async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "consent") {
   // 1) si ya está en memoria, OK
   if (isTokenValid()) return oauthAccessToken;
@@ -90,28 +91,39 @@ async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "c
   loadStoredOAuth();
   if (isTokenValid()) return oauthAccessToken;
 
-  // 3) Si es interactivo (el usuario tocó), NO intentamos silent primero.
-  if (allowInteractive) {
-    // Si el usuario tocó "Conectar", ahí sí le podés pasar "select_account consent"
-    const r = await requestAccessToken({ prompt: interactivePrompt ?? "" });
-
-    oauthAccessToken = r.access_token;
-    oauthExpiresAt = Date.now() + (r.expires_in * 1000);
-    saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
-    return oauthAccessToken;
-  }
-
-  // 4) Background/silent: intentamos prompt:"none" (silent real)
+  // 3) Silent refresh (siempre primero: estilo Drive Gigante)
   try {
-    const r = await requestAccessToken({ prompt: "none" });
+    const hintEmail = loadStoredOAuthEmail();
+    console.log("[ensureOAuthToken] silent refresh, hint =", hintEmail);
 
+    // prompt undefined => NO se envía (más permisivo que "none")
+    const r = await requestAccessToken({
+      prompt: undefined,
+      hint: hintEmail
+    });
+
+    if (r?.access_token) {
+      oauthAccessToken = r.access_token;
+      oauthExpiresAt = Date.now() + (r.expires_in * 1000);
+      saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
+      return oauthAccessToken;
+    }
+  } catch (e) {
+    console.warn("[ensureOAuthToken] silent failed:", e?.message || e);
+    // seguimos abajo si allowInteractive = true
+  }
+
+  // 4) Si el llamado fue interactivo (click del usuario), recién ahí popup
+  if (allowInteractive) {
+    const r = await requestAccessToken({ prompt: interactivePrompt ?? "consent" });
     oauthAccessToken = r.access_token;
     oauthExpiresAt = Date.now() + (r.expires_in * 1000);
     saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
     return oauthAccessToken;
-  } catch {
-    throw new Error("TOKEN_NEEDS_INTERACTIVE");
   }
+
+  // 5) No interactivo y silent falló -> pedir conectar
+  throw new Error("TOKEN_NEEDS_INTERACTIVE");
 }
 
 // =====================
@@ -124,6 +136,19 @@ const LS_PENDING = "tareas_drive_pending_v1";
 // OAuth token persistente (evita pedir permisos en cada refresh)
 // =====================
 const LS_OAUTH = "tareas_oauth_token_v1";
+
+const LS_OAUTH_EMAIL = "tareas_oauth_email_v1";
+
+function loadStoredOAuthEmail() {
+  try { return String(localStorage.getItem(LS_OAUTH_EMAIL) || "").trim().toLowerCase(); }
+  catch { return ""; }
+}
+function saveStoredOAuthEmail(email) {
+  try { localStorage.setItem(LS_OAUTH_EMAIL, String(email || "").trim().toLowerCase()); } catch { }
+}
+function clearStoredOAuthEmail() {
+  try { localStorage.removeItem(LS_OAUTH_EMAIL); } catch { }
+}
 
 function loadStoredOAuth() {
   try {
@@ -154,6 +179,7 @@ function clearStoredOAuth() {
   try { localStorage.removeItem(LS_OAUTH); } catch { }
   oauthAccessToken = "";
   oauthExpiresAt = 0;
+  clearStoredOAuthEmail();
 }
 
 
@@ -186,7 +212,7 @@ btnConnect.addEventListener("click", async () => {
     setSync("saving", "Autorizando…");
 
     // 1) Pedimos token con selector (puede ser cualquier cuenta)
-    await ensureOAuthToken(true, "select_account consent");
+    await ensureOAuthToken(true, "consent");
 
     // 2) VALIDAMOS contra backend (allowlist real)
     const r = await verifyBackendAccessOrThrow();
@@ -195,6 +221,8 @@ btnConnect.addEventListener("click", async () => {
     try {
       const who = await apiGet("whoami");
       if (who?.ok === true) {
+        saveStoredOAuthEmail(who.email);
+        console.log("Email guardado para hint:", who.email);
         toast("Backend ve tu cuenta ✅", "ok", `Email: ${who.email}`);
       } else {
         toast("Backend no reconoce la cuenta", "warn", `${who?.error || "unknown"}${who?.email ? " (" + who.email + ")" : ""}`);
@@ -509,10 +537,19 @@ function jsonp(url, timeoutMs = 15000) {
 }
 
 async function apiGet(action) {
-  const token = await ensureOAuthToken(false);
-  const url = `${API_BASE}?action=${encodeURIComponent(action)}&access_token=${encodeURIComponent(token)}`;
-  return await jsonp(url);
+  console.log("[apiGet] isTokenValid before:", isTokenValid(), "expiresIn(ms):", (oauthExpiresAt - Date.now()));
+  try {
+    const token = await ensureOAuthToken(false);
+    const url = `${API_BASE}?action=${encodeURIComponent(action)}&access_token=${encodeURIComponent(token)}`;
+    return await jsonp(url);
+  } catch (e) {
+    const msg = String(e?.message || e || "");
+    if (msg === "TOKEN_NEEDS_INTERACTIVE") throw e;
+    // cualquier otro error lo propagamos igual
+    throw e;
+  }
 }
+
 
 async function verifyBackendAccessOrThrow() {
   const r = await apiGet("get");
@@ -521,11 +558,12 @@ async function verifyBackendAccessOrThrow() {
   if (r?.ok !== true) {
     const err = String(r?.error || "unknown_error");
     if (err === "forbidden") {
+      // cuenta no permitida -> sí limpiamos
       clearStoredOAuth();
       throw new Error("NOT_AUTHORIZED");
     }
     if (err === "auth_required") {
-      clearStoredOAuth();
+      // token vencido / no válido -> NO limpies (solo pedí reconectar)
       throw new Error("TOKEN_NEEDS_INTERACTIVE");
     }
     throw new Error("BACKEND_ERROR:" + err);
@@ -653,10 +691,17 @@ function scheduleSave(reason = "") {
       // Verificación rápida de cuenta/autorización antes de intentar guardar
       try {
         const check = await apiGet("get");
-        if (check?.ok === false && (check?.error === "forbidden" || check?.error === "auth_required")) {
-          setSync("offline", "Cuenta no autorizada");
-          toast("Cuenta no autorizada", "err", "Tocá Conectar y elegí otra cuenta.");
-          return;
+        if (check?.ok === false) {
+          if (check?.error === "forbidden") {
+            setSync("offline", "Cuenta no autorizada");
+            toast("Cuenta no autorizada", "err", "Tocá Conectar y elegí otra cuenta.");
+            return;
+          }
+          if (check?.error === "auth_required") {
+            setSync("offline", "Necesita Conectar");
+            toast("Necesitás autorizar", "warn", "Tocá el botón Conectar.");
+            return;
+          }
         }
       } catch (e) {
         if ((e?.message || "") === "TOKEN_NEEDS_INTERACTIVE") {
@@ -790,43 +835,23 @@ async function refreshFromRemote(showToast = true) {
 
     if (resp?.ok !== true) {
       const err = String(resp?.error || "");
-      if (err === "forbidden" || err === "auth_required") {
+
+      if (err === "forbidden") {
         setSync("offline", "Cuenta no autorizada");
         toast("Cuenta no autorizada", "err", "Tocá Conectar y elegí otra cuenta.");
-        clearStoredOAuth();
+        clearStoredOAuth(); // solo en forbidden
         return;
       }
+
+      if (err === "auth_required") {
+        setSync("offline", "Necesita Conectar");
+        toast("Necesitás autorizar", "warn", "Tocá el botón Conectar.");
+        // NO borrar token acá
+        return;
+      }
+
       setSync("offline", "Error backend");
       toast("Error backend", "err", err || "unknown");
-      return;
-    }
-
-
-    // Backend auth handling
-    if (resp?.ok === false && (resp?.error === "forbidden" || resp?.error === "auth_required")) {
-      setSync("offline", "Cuenta no autorizada");
-      toast("Cuenta no autorizada", "err", "Elegí otra cuenta para Conectar.");
-
-      clearStoredOAuth();        // 👈 borra token local (si era de cuenta no permitida)
-      oauthAccessToken = "";     // 👈 por las dudas
-      oauthExpiresAt = 0;
-
-      // Fuerza selector de cuenta
-      try {
-        await ensureOAuthToken(true, "select_account consent");
-        // reintenta una vez ya con otra cuenta
-        const resp2 = await apiGet("get");
-        if (resp2?.ok === true) {
-          listaItems = dedupNormalize(Array.isArray(resp2.items) ? resp2.items : []);
-          remoteMeta = { updatedAt: Number(resp2?.meta?.updatedAt || 0) };
-          saveCache(listaItems, remoteMeta);
-          render();
-          setSync("ok", "Listo ✅");
-          toast("Conectado ✅", "ok", "Cuenta autorizada.");
-        }
-      } catch {
-        // si cancela, queda en modo offline
-      }
       return;
     }
 
@@ -950,14 +975,23 @@ window.addEventListener("load", async () => {
   input1.focus();
 
   // Esperar GIS y preparar token client
-  const waitGIS = () => new Promise((res) => {
+  const waitGIS = (timeoutMs = 15000) => new Promise((res, rej) => {
+    const start = Date.now();
     const t = setInterval(() => {
       if (window.google?.accounts?.oauth2) { clearInterval(t); res(); }
+      if (Date.now() - start > timeoutMs) { clearInterval(t); rej(new Error("GIS_LOAD_TIMEOUT")); }
     }, 80);
   });
 
-  await waitGIS();
-  initOAuth();
+  try {
+    await waitGIS();
+    initOAuth();
+  } catch (e) {
+    setSync("offline", "No cargó Google Auth");
+    toast("No cargó Google Auth", "err", "Revisá que esté incluido el script de GIS.");
+    return;
+  }
+
 
   // Si no hay token (ni guardado ni válido), NO intentes sincronizar en background
   // (evita "Sincronizando..." infinito por interaction_required)
@@ -1001,5 +1035,13 @@ window.addEventListener("load", async () => {
     // sin token: quedamos en modo offline hasta que toque "Conectar"
     setSync("offline", "Necesita Conectar");
   }
+
+  // DEBUG: forzar expiración para probar refresh silencioso
+  window.__expireTokenNow = () => {
+    oauthExpiresAt = Date.now() - 1000;
+    saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
+    console.log("Token forzado a expirar.");
+  };
+
 
 });
