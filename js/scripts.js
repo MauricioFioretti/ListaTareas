@@ -99,22 +99,22 @@ async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "c
   if (isTokenValid()) return oauthAccessToken;
 
   // 2) si hay token guardado, cargarlo
-  loadStoredOAuth();
+  const hadStored = loadStoredOAuth();
   if (isTokenValid()) return oauthAccessToken;
 
-  // 3) Refresh "permisivo" tipo Drive XL:
-  // - si Google puede autorizar sin preguntar: se cierra solo
-  // - si NO puede: puede mostrar chooser (limitación del navegador/cookies)
+  // ✅ CORTE: si NO es interactivo y NO había nada guardado, NO llames GIS (evita popups)
+  const hintEmail = loadStoredOAuthEmail();
+  if (!allowInteractive && !hadStored && !hintEmail) {
+    throw new Error("TOKEN_NEEDS_INTERACTIVE");
+  }
+
+  // 3) Refresh "permisivo"
   try {
-    const hintEmail = loadStoredOAuthEmail();
     console.log("[ensureOAuthToken] refresh permissive, hint =", hintEmail);
 
     const r = await requestAccessToken({
-      // ✅ NO mandamos prompt (permite auto-approve si hay sesión)
-      prompt: undefined,
-
-      // ✅ clave para evitar chooser cuando se puede
-      hint: hintEmail
+      prompt: undefined,      // no forzar consent
+      hint: hintEmail || undefined
     });
 
     if (r?.access_token) {
@@ -127,7 +127,7 @@ async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "c
     console.warn("[ensureOAuthToken] permissive refresh failed:", e?.message || e);
   }
 
-  // 4) Si el llamado fue interactivo (click del usuario), recién ahí popup
+  // 4) Interactivo: recién ahí popup
   if (allowInteractive) {
     const r = await requestAccessToken({ prompt: interactivePrompt ?? "consent" });
     oauthAccessToken = r.access_token;
@@ -136,7 +136,6 @@ async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "c
     return oauthAccessToken;
   }
 
-  // 5) No interactivo y silent falló -> pedir conectar
   throw new Error("TOKEN_NEEDS_INTERACTIVE");
 }
 
@@ -598,7 +597,12 @@ function isOnline() {
 // =====================
 
 async function apiCall(mode, items, extra = {}) {
-  const token = await ensureOAuthToken(false);
+  let token = "";
+  try {
+    token = await ensureOAuthToken(false);
+  } catch (e) {
+    throw new Error("TOKEN_NEEDS_INTERACTIVE");
+  }
 
   const payload = { mode, access_token: token, ...extra };
   if (items) payload.items = items;
@@ -764,28 +768,7 @@ function scheduleSave(reason = "") {
     saving = true;
 
     try {
-      const startedVersion = localVersion;
 
-      // Verificación rápida de cuenta/autorización antes de intentar guardar
-      try {
-        const check = await apiGet("get");
-        if (check?.ok === false) {
-          if (check?.error === "auth_required") {
-            setSync("offline", "Necesita Conectar");
-            toast("Necesitás autorizar", "warn", "Tocá el botón Conectar.");
-            return;
-          }
-        }
-
-      } catch (e) {
-        if ((e?.message || "") === "TOKEN_NEEDS_INTERACTIVE") {
-          setSync("offline", "Necesita Conectar");
-          toast("Necesitás autorizar", "warn", "Tocá el botón Conectar.");
-          return;
-        }
-      }
-
-      // ===== Guardado con MERGE automático (remoto + local, respetando borrados) =====
       const before = await apiGet("get");
       if (before?.ok !== true) {
         if (before?.error === "auth_required") throw new Error("TOKEN_NEEDS_INTERACTIVE");
