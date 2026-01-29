@@ -239,46 +239,59 @@ function clearStoredOAuth() {
 
 
 // =====================
-// UI construir estructura
+// UI construir estructura (HEADER 2-LINEAS)
 // =====================
 const header = document.querySelector("header");
 
+// contenedor principal del header
 const titulo = document.createElement("section");
 titulo.classList = "titulo";
 header.appendChild(titulo);
 
+// ----- fila 1: título -----
+const headerRow1 = document.createElement("div");
+headerRow1.className = "header-row header-row-1";
+titulo.appendChild(headerRow1);
+
 const h1 = document.createElement("h1");
 h1.innerText = "Lista de Tareas";
-titulo.appendChild(h1);
+headerRow1.appendChild(h1);
 
+// ----- fila 2: controles -----
+const headerRow2 = document.createElement("div");
+headerRow2.className = "header-row header-row-2";
+titulo.appendChild(headerRow2);
+
+// estado sync
 const syncPill = document.createElement("div");
 syncPill.className = "sync-pill";
 syncPill.innerHTML = `<span class="sync-dot"></span><span class="sync-text">Cargando…</span>`;
-titulo.appendChild(syncPill);
+headerRow2.appendChild(syncPill);
+
+// botones (agrupados)
+const headerActions = document.createElement("div");
+headerActions.className = "header-actions";
+headerRow2.appendChild(headerActions);
 
 const btnConnect = document.createElement("button");
 btnConnect.className = "btn-connect";
 btnConnect.textContent = "Conectar";
-btnConnect.style.marginLeft = "10px";
-titulo.appendChild(btnConnect);
+btnConnect.dataset.mode = "connect";
+headerActions.appendChild(btnConnect);
 
 // --- Botón refresh/reintento (estilo Drive XL) ---
 const btnRefresh = document.createElement("button");
 btnRefresh.className = "btn-refresh";
 btnRefresh.textContent = "↻";
 btnRefresh.title = "Reintentar conexión / Refrescar";
-btnRefresh.style.marginLeft = "8px";
 btnRefresh.style.display = "none"; // solo aparece cuando hace falta
-titulo.appendChild(btnRefresh);
+headerActions.appendChild(btnRefresh);
 
-// --- UI cuenta (estilo Drive XL) ---
+// email (a la derecha, con truncado)
 const accountPill = document.createElement("div");
 accountPill.className = "account-pill";
-accountPill.style.marginLeft = "10px";
-accountPill.style.opacity = "0.9";
-accountPill.style.fontSize = "13px";
-accountPill.textContent = ""; // acá va el email
-titulo.appendChild(accountPill);
+accountPill.textContent = "";
+headerRow2.appendChild(accountPill);
 
 function setAccountUI(email) {
   const e = (email || "").trim();

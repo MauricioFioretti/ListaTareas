@@ -26,10 +26,44 @@ body {
 .titulo {
   margin-bottom: 1.0rem;
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
+  flex-direction: column;
+  gap: .65rem;
 }
+
+.header-row {
+  display: flex;
+  align-items: center;
+  gap: .8rem;
+}
+
+.header-row-1 {
+  justify-content: flex-start;
+}
+
+.header-row-2 {
+  justify-content: space-between;
+  gap: .8rem;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: .55rem;
+  flex: 0 0 auto;
+}
+
+/* email prolijo y sin romper layout */
+.account-pill {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: .9;
+  font-size: 13px;
+  color: var(--yt-text-muted);
+  padding-left: .4rem;
+}
+
 .titulo h1 {
   color: #fff;
   font-size: 1.6rem;
@@ -109,6 +143,20 @@ button {
 }
 button:hover { background: var(--yt-btn-hover); }
 button:active { background: #4d4d4d; transform: scale(0.995); }
+
+/* Botones del header: más prolijos */
+.btn-connect, .btn-refresh {
+  border-radius: 999px;
+  padding: 7px 14px;
+  font-size: 0.88rem;
+}
+
+.btn-refresh {
+  width: 38px;
+  padding: 7px 0;
+  text-align: center;
+  font-weight: 700;
+}
 
 .agregarItem button {
   background: #3ea6ff;
@@ -277,6 +325,23 @@ button:active { background: #4d4d4d; transform: scale(0.995); }
     width: 100%;
     min-width: 0;
   }
+
+    .header-row-2 {
+    flex-direction: column;
+    align-items: stretch;
+    gap: .55rem;
+  }
+
+  .header-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .account-pill {
+    max-width: 100%;
+    padding-left: 0;
+  }
+
 }
 
 /* ====== Tablet ====== */
