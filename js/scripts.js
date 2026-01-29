@@ -15,7 +15,9 @@ const OAUTH_CLIENT_ID = "917192108969-6d693ji2l5ku1vsje8s6brvio2j01hio.apps.goog
 const OAUTH_SCOPES =
   "openid email profile " +
   "https://www.googleapis.com/auth/userinfo.email " +
-  "https://www.googleapis.com/auth/userinfo.profile";
+  "https://www.googleapis.com/auth/userinfo.profile " +   // 👈 espacio al final
+  "https://www.googleapis.com/auth/drive.metadata.readonly";
+
 
 async function forceSwitchAccount() {
   // obliga a Google a mostrar el selector de cuenta
@@ -254,7 +256,7 @@ btnConnect.addEventListener("click", async () => {
       await forceSwitchAccount(); // limpia y abre selector (select_account)
     } else {
       // SIEMPRE mostrar selector para evitar quedar pegado a la última cuenta (no autorizada)
-      await ensureOAuthToken(true, "select_account");
+      await ensureOAuthToken(true, "consent");
     }
 
 
@@ -546,100 +548,42 @@ function isOnline() {
 // =====================
 // API: GET por JSONP (evita CORS de Apps Script)
 // =====================
-function apiGetJsonp(mode) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      const token = await ensureOAuthToken(false);
+// =====================
+// API (sin token en URL)
+// - Usamos POST text/plain para evitar preflight
+// - El backend devuelve JSON normal
+// =====================
 
-      const cb = "__cb_" + Math.random().toString(36).slice(2);
-      const url =
-        `${API_BASE}?mode=${encodeURIComponent(mode)}` +
-        `&access_token=${encodeURIComponent(token)}` +
-        `&callback=${encodeURIComponent(cb)}` +
-        `&ts=${Date.now()}`;
-
-      const s = document.createElement("script");
-
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error("JSONP_TIMEOUT"));
-      }, 15000);
-
-      function cleanup() {
-        clearTimeout(timer);
-        try { delete window[cb]; } catch {}
-        if (s.parentNode) s.parentNode.removeChild(s);
-      }
-
-      window[cb] = (data) => {
-        cleanup();
-        resolve(data);
-      };
-
-      s.onerror = () => {
-        cleanup();
-        reject(new Error("JSONP_LOAD_ERROR"));
-      };
-
-      s.src = url;
-      document.head.appendChild(s);
-    } catch (e) {
-      reject(e);
-    }
-  });
-}
-
-async function apiGet(mode) {
-  // Ahora GET usa JSONP (sin CORS)
-  return await apiGetJsonp(mode);
-}
-
-async function apiPost(items) {
+async function apiCall(mode, items) {
   const token = await ensureOAuthToken(false);
+
+  const payload = { mode, access_token: token };
+  if (items) payload.items = items;
+
   const r = await fetch(API_BASE, {
     method: "POST",
     headers: { "Content-Type": "text/plain;charset=utf-8" }, // evita preflight
-    body: JSON.stringify({ access_token: token, items })
+    body: JSON.stringify(payload)
   });
-  return await r.json();
-}
 
-async function verifyBackendAccessOrThrow() {
-  const r = await apiGet("get");
-  console.log("VERIFY:", r);
-
-  if (r?.ok !== true) {
-    const err = String(r?.error || "unknown_error");
-    if (err === "auth_required") {
-      throw new Error("TOKEN_NEEDS_INTERACTIVE");
-    }
-    if (err === "wrong_audience") {
-      // token válido, pero NO emitido para tu OAuth Client ID
-      clearStoredOAuth();
-      throw new Error("TOKEN_NEEDS_INTERACTIVE");
-    }
-
-    throw new Error("BACKEND_ERROR:" + err);
+  // Si esto falla, vas a ver el error real (en vez de "opaque")
+  const text = await r.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error("API_NON_JSON_RESPONSE: " + text.slice(0, 200));
   }
-  return r;
+
 }
 
-// POST no-cors (sin token)
+async function apiGet(mode) {
+  return await apiCall(mode);
+}
+
 async function apiSet(items) {
-  const token = await ensureOAuthToken(false);
-
-  // POST a Apps Script: lo hacemos "fire-and-forget"
-  // porque leer respuesta dispara CORS.
-  await fetch(API_BASE, {
-    method: "POST",
-    mode: "no-cors", // 👈 clave
-    headers: { "Content-Type": "text/plain;charset=utf-8" }, // evita preflight
-    body: JSON.stringify({ access_token: token, items })
-  });
-
-  // No podemos leer JSON (opaque), confirmamos con GET JSONP luego.
-  return { ok: true };
+  return await apiCall("set", items);
 }
+
 
 // =====================
 // Render
