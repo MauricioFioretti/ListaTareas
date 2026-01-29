@@ -262,6 +262,15 @@ btnConnect.textContent = "Conectar";
 btnConnect.style.marginLeft = "10px";
 titulo.appendChild(btnConnect);
 
+// --- Botón refresh/reintento (estilo Drive XL) ---
+const btnRefresh = document.createElement("button");
+btnRefresh.className = "btn-refresh";
+btnRefresh.textContent = "↻";
+btnRefresh.title = "Reintentar conexión / Refrescar";
+btnRefresh.style.marginLeft = "8px";
+btnRefresh.style.display = "none"; // solo aparece cuando hace falta
+titulo.appendChild(btnRefresh);
+
 // --- UI cuenta (estilo Drive XL) ---
 const accountPill = document.createElement("div");
 accountPill.className = "account-pill";
@@ -284,6 +293,10 @@ function setAccountUI(email) {
   }
 }
 
+// Click: reintentar conexión + refresh sin selector de cuenta (silent first)
+btnRefresh.addEventListener("click", async () => {
+  await reconnectAndRefresh({ showToast: true });
+});
 
 btnConnect.addEventListener("click", async () => {
   try {
@@ -471,6 +484,10 @@ function setSync(state, text) {
   syncPill.classList.remove("ok", "saving", "offline");
   if (state) syncPill.classList.add(state);
   syncPill.querySelector(".sync-text").textContent = text;
+
+  // Mostrar refresh solo cuando estamos "offline / necesita conectar"
+  const needs = (state === "offline") && /necesita conectar/i.test(String(text || ""));
+  if (btnRefresh) btnRefresh.style.display = needs ? "inline-block" : "none";
 }
 
 function escapeHtml(s) {
@@ -704,6 +721,51 @@ async function verifyBackendAccessOrThrow() {
   throw new Error(err || "auth_required");
 }
 
+// =====================
+// Reconnect / Refresh (silent-first)
+// =====================
+let reconnecting = false;
+
+async function reconnectAndRefresh({ showToast = true } = {}) {
+  if (reconnecting) return;
+  reconnecting = true;
+
+  try {
+    setSync("saving", "Reconectando…");
+
+    // 1) Intento SILENT (no popup)
+    await ensureOAuthToken(false);
+
+    // 2) Validar backend (allowlist real)
+    const who = await apiGet("whoami");
+    if (who?.ok === true && who.email) {
+      saveStoredOAuthEmail(who.email);
+      setAccountUI(who.email);
+    } else {
+      setAccountUI(loadStoredOAuthEmail());
+    }
+
+    // 3) Traer lista real
+    await refreshFromRemote(false);
+
+    setSync("ok", "Conectado ✅");
+    if (showToast) toast("Conectado ✅", "ok", "Reconexión automática.");
+  } catch (e) {
+    const msg = String(e?.message || "");
+
+    // Si silent no pudo -> mostramos estado correcto y dejamos el botón refresh visible
+    if (msg === "TOKEN_NEEDS_INTERACTIVE") {
+      setSync("offline", "Necesita Conectar");
+      if (showToast) toast("Necesitás autorizar", "warn", "Tocá Conectar.");
+      return;
+    }
+
+    setSync("offline", "Necesita Conectar");
+    if (showToast) toast("No se pudo reconectar", "err", msg);
+  } finally {
+    reconnecting = false;
+  }
+}
 
 // =====================
 // Render
@@ -1125,14 +1187,19 @@ window.addEventListener("load", async () => {
   // (evita "Sincronizando..." infinito por interaction_required)
   loadStoredOAuth?.(); // si existe la función de token persistente
 
-  // UI: si tenías email guardado, mostrálalo como en Drive XL
-  setAccountUI(loadStoredOAuthEmail());
+  // UI: si tenías email guardado, mostrálo como en Drive XL
+  const hinted = loadStoredOAuthEmail();
+  setAccountUI(hinted);
 
-
+  // Si el token está inválido, intentamos reconexión SILENT si tenemos hint (sin popup)
+  // Esto evita que quede "Necesita Conectar" hasta que el usuario toque algo.
   if (!isTokenValid()) {
     setSync("offline", "Necesita Conectar");
-    // Importante: NO salimos del load, dejamos que renderice cache/pending si hay,
-    // pero evitamos el refresh remoto automático.
+
+    if (hinted) {
+      // intento silent en background (sin toast para que no moleste)
+      reconnectAndRefresh({ showToast: false });
+    }
   }
 
   // 1) cache instantáneo
@@ -1187,7 +1254,7 @@ window.addEventListener("load", async () => {
         // Solo intentar si hay algo que refrescar
         if (!oauthAccessToken) loadStoredOAuth();
         if (!oauthAccessToken) return;
-        
+
 
         // Solo si la pestaña está visible (reduce chance de bloqueos)
         if (document.visibilityState !== "visible") return;
@@ -1218,5 +1285,14 @@ window.addEventListener("load", async () => {
     console.log("Token forzado a expirar.");
   };
 
+  // Si la pestaña vuelve a estar visible y estamos en "Necesita Conectar", reintentar silent
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+
+    const txt = syncPill?.querySelector(".sync-text")?.textContent || "";
+    if (/necesita conectar/i.test(txt)) {
+      reconnectAndRefresh({ showToast: false });
+    }
+  });
 
 });
