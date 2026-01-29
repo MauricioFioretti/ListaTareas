@@ -277,14 +277,8 @@ btnConnect.addEventListener("click", async () => {
       setAccountUI(loadStoredOAuthEmail());
     }
 
-    // 4) Si ok:true, cargamos items
-    const items = Array.isArray(r.items) ? r.items : [];
-    const ua = Number(r?.meta?.updatedAt || 0);
-
-    listaItems = dedupNormalize(items);
-    remoteMeta = { updatedAt: ua };
-    saveCache(listaItems, remoteMeta);
-    render();
+    // 4) Conectado OK → ahora sí cargamos la lista real desde backend
+    await refreshFromRemote(true);
 
     setSync("ok", "Conectado ✅");
     toast("Conectado ✅", "ok", "Cuenta autorizada.");
@@ -581,6 +575,15 @@ async function apiGet(mode) {
 }
 
 async function apiSet(items) {
+  if (!Array.isArray(items)) {
+    throw new Error("apiSet_invalid_items");
+  }
+
+  if (items.length === 0) {
+    console.warn("⚠️ apiSet bloqueado: intento de guardar lista vacía");
+    throw new Error("apiSet_empty_blocked");
+  }
+
   return await apiCall("set", items);
 }
 
