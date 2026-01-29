@@ -43,8 +43,19 @@ function initOAuth() {
 
     callback: () => { }
   });
+}
 
-
+async function fetchUserEmailFromToken(token) {
+  try {
+    const r = await fetch("https://openidconnect.googleapis.com/v1/userinfo", {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (!r.ok) return "";
+    const data = await r.json();
+    return String(data?.email || "").trim().toLowerCase();
+  } catch {
+    return "";
+  }
 }
 
 function requestAccessToken({ prompt, hint } = {}) {
@@ -102,18 +113,19 @@ async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "c
   const hadStored = loadStoredOAuth();
   if (isTokenValid()) return oauthAccessToken;
 
-  // ✅ CORTE: si NO es interactivo y NO había nada guardado, NO llames GIS (evita popups)
   const hintEmail = loadStoredOAuthEmail();
+
+  // ✅ CORTE: si NO es interactivo y NO había nada guardado, NO llames GIS
   if (!allowInteractive && !hadStored && !hintEmail) {
     throw new Error("TOKEN_NEEDS_INTERACTIVE");
   }
 
-  // 3) Refresh "permisivo"
+  // 3) Silent real (prompt:"")
   try {
-    console.log("[ensureOAuthToken] refresh permissive, hint =", hintEmail);
+    console.log("[ensureOAuthToken] silent refresh, hint =", hintEmail);
 
     const r = await requestAccessToken({
-      prompt: undefined,      // no forzar consent
+      prompt: "",                 // ✅ silent real estilo Drive XL
       hint: hintEmail || undefined
     });
 
@@ -121,18 +133,28 @@ async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "c
       oauthAccessToken = r.access_token;
       oauthExpiresAt = Date.now() + (r.expires_in * 1000);
       saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
+
+      // 🔑 Guardar email como hint (no depende de backend)
+      const em = await fetchUserEmailFromToken(oauthAccessToken);
+      if (em) saveStoredOAuthEmail(em);
+
       return oauthAccessToken;
     }
   } catch (e) {
-    console.warn("[ensureOAuthToken] permissive refresh failed:", e?.message || e);
+    console.warn("[ensureOAuthToken] silent refresh failed:", e?.message || e);
   }
 
-  // 4) Interactivo: recién ahí popup
+  // 4) Interactivo
   if (allowInteractive) {
     const r = await requestAccessToken({ prompt: interactivePrompt ?? "consent" });
     oauthAccessToken = r.access_token;
     oauthExpiresAt = Date.now() + (r.expires_in * 1000);
     saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
+
+    // 🔑 también acá
+    const em = await fetchUserEmailFromToken(oauthAccessToken);
+    if (em) saveStoredOAuthEmail(em);
+
     return oauthAccessToken;
   }
 
@@ -596,30 +618,58 @@ function isOnline() {
 // - El backend devuelve JSON normal
 // =====================
 
-async function apiCall(mode, items, extra = {}) {
+async function apiCall(mode, items, extra = {}, { allowInteractive = false, retry = true } = {}) {
   let token = "";
+
   try {
-    token = await ensureOAuthToken(false);
-  } catch (e) {
+    token = await ensureOAuthToken(allowInteractive, allowInteractive ? "consent" : "consent");
+  } catch {
     throw new Error("TOKEN_NEEDS_INTERACTIVE");
   }
 
   const payload = { mode, access_token: token, ...extra };
   if (items) payload.items = items;
 
-  const r = await fetch(API_BASE, {
+  let r = await fetch(API_BASE, {
     method: "POST",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
     body: JSON.stringify(payload)
   });
 
-  const text = await r.text();
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new Error("API_NON_JSON_RESPONSE: " + text.slice(0, 200));
+  // si OK -> parse
+  let text = await r.text();
+  let data = null;
+  try { data = JSON.parse(text); } catch { data = null; }
+
+  // si auth error y podemos retry: renovar token y reintentar 1 vez
+  if (retry && (data?.error === "auth_required" || data?.error === "wrong_audience")) {
+    try {
+      // fuerza refresh silent otra vez
+      await ensureOAuthToken(false);
+    } catch {
+      if (!allowInteractive) throw new Error("TOKEN_NEEDS_INTERACTIVE");
+      await ensureOAuthToken(true, "consent");
+    }
+
+    // reintento
+    token = oauthAccessToken;
+    payload.access_token = token;
+
+    r = await fetch(API_BASE, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(payload)
+    });
+
+    text = await r.text();
+    try { return JSON.parse(text); }
+    catch { throw new Error("API_NON_JSON_RESPONSE: " + text.slice(0, 200)); }
   }
+
+  if (!data) throw new Error("API_NON_JSON_RESPONSE: " + text.slice(0, 200));
+  return data;
 }
+
 
 async function apiGet(mode) {
   return await apiCall(mode);
@@ -631,7 +681,7 @@ async function apiSet(items, expectedUpdatedAt = 0) {
     console.warn("⚠️ apiSet bloqueado: intento de guardar lista vacía");
     throw new Error("apiSet_empty_blocked");
   }
-  return await apiCall("set", items, { expectedUpdatedAt: Number(expectedUpdatedAt || 0) });
+  return await apiCall("set", items, { expectedUpdatedAt: Number(expectedUpdatedAt || 0) }, { allowInteractive: true });
 }
 
 // =====================
@@ -1135,7 +1185,9 @@ window.addEventListener("load", async () => {
     tokenRefreshTimer = setInterval(async () => {
       try {
         // Solo intentar si hay algo que refrescar
+        if (!oauthAccessToken) loadStoredOAuth();
         if (!oauthAccessToken) return;
+        
 
         // Solo si la pestaña está visible (reduce chance de bloqueos)
         if (document.visibilityState !== "visible") return;
@@ -1147,7 +1199,7 @@ window.addEventListener("load", async () => {
         console.log("[token] proactive refresh, msLeft:", msLeft);
 
         // Refresh permisivo (puede abrir popup "espera un momento..." y cerrarse solo)
-        await ensureOAuthToken(false);
+        await ensureOAuthToken(false).catch(() => { });
 
       } catch (e) {
         // Si no pudo, NO forzamos nada acá. Se verá como "Necesita Conectar" cuando toque API.
