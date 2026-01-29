@@ -584,6 +584,26 @@ async function apiSet(items) {
   return await apiCall("set", items);
 }
 
+// =====================
+// Backend access check (whoami)
+// =====================
+async function verifyBackendAccessOrThrow() {
+  // Si ya llegaste acá, normalmente venís de un click que ya obtuvo token interactivo.
+  // Igual hacemos el chequeo real en tu backend.
+  const r = await apiGet("whoami");
+
+  if (r?.ok === true) return r;
+
+  const err = String(r?.error || "auth_required");
+
+  // Si el backend te devuelve estos, mostrarlos claro:
+  if (err === "auth_required") throw new Error("auth_required");
+  if (err === "wrong_audience") throw new Error("wrong_audience");
+  if (err === "missing_scope") throw new Error("missing_scope");
+
+  throw new Error(err || "auth_required");
+}
+
 
 // =====================
 // Render
