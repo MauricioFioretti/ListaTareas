@@ -146,6 +146,26 @@ async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "c
 const LS_CACHE = "tareas_drive_cache_v1";
 const LS_PENDING = "tareas_drive_pending_v1";
 
+const LS_TOMBSTONES = "tareas_drive_tombstones_v1";
+
+// borrados intencionales por el usuario (para que el merge no los re-agregue)
+function loadTombstones() {
+  try {
+    const raw = localStorage.getItem(LS_TOMBSTONES);
+    const arr = raw ? JSON.parse(raw) : [];
+    return new Set((arr || []).map(x => String(x || "").toLowerCase()).filter(Boolean));
+  } catch {
+    return new Set();
+  }
+}
+function saveTombstones(set) {
+  try { localStorage.setItem(LS_TOMBSTONES, JSON.stringify([...set])); } catch { }
+}
+function clearTombstones() {
+  try { localStorage.removeItem(LS_TOMBSTONES); } catch { }
+}
+
+
 // =====================
 // OAuth token persistente (evita pedir permisos en cada refresh)
 // =====================
@@ -404,6 +424,7 @@ const toastRoot = document.getElementById("toast-root");
 // =====================
 let listaItems = [];
 let remoteMeta = { updatedAt: 0 };
+let tombstones = loadTombstones();
 
 async function waitRemoteUpdate(prevUpdatedAt, timeoutMs = 2500) {
   const start = Date.now();
@@ -490,6 +511,34 @@ function dedupNormalize(items) {
   return ordenarLista(out);
 }
 
+function keyOf(texto) {
+  return normalizarTexto(texto).toLowerCase();
+}
+
+function mergeRemoteWithLocal(remoteItems, localItems, tombstonesSet) {
+  const map = new Map(); // key -> {texto, completado}
+
+  // 1) base: remoto
+  for (const it of (remoteItems || [])) {
+    const texto = normalizarTexto(it?.texto);
+    if (!texto) continue;
+    const k = keyOf(texto);
+    if (tombstonesSet?.has(k)) continue;
+    map.set(k, { texto, completado: !!it?.completado });
+  }
+
+  // 2) overlay: local (gana local)
+  for (const it of (localItems || [])) {
+    const texto = normalizarTexto(it?.texto);
+    if (!texto) continue;
+    const k = keyOf(texto);
+    if (tombstonesSet?.has(k)) continue;
+    map.set(k, { texto, completado: !!it?.completado });
+  }
+
+  return dedupNormalize([...map.values()]);
+}
+
 // =====================
 // Cache
 // =====================
@@ -548,43 +597,37 @@ function isOnline() {
 // - El backend devuelve JSON normal
 // =====================
 
-async function apiCall(mode, items) {
+async function apiCall(mode, items, extra = {}) {
   const token = await ensureOAuthToken(false);
 
-  const payload = { mode, access_token: token };
+  const payload = { mode, access_token: token, ...extra };
   if (items) payload.items = items;
 
   const r = await fetch(API_BASE, {
     method: "POST",
-    headers: { "Content-Type": "text/plain;charset=utf-8" }, // evita preflight
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
     body: JSON.stringify(payload)
   });
 
-  // Si esto falla, vas a ver el error real (en vez de "opaque")
   const text = await r.text();
   try {
     return JSON.parse(text);
   } catch {
     throw new Error("API_NON_JSON_RESPONSE: " + text.slice(0, 200));
   }
-
 }
 
 async function apiGet(mode) {
   return await apiCall(mode);
 }
 
-async function apiSet(items) {
-  if (!Array.isArray(items)) {
-    throw new Error("apiSet_invalid_items");
-  }
-
+async function apiSet(items, expectedUpdatedAt = 0) {
+  if (!Array.isArray(items)) throw new Error("apiSet_invalid_items");
   if (items.length === 0) {
     console.warn("⚠️ apiSet bloqueado: intento de guardar lista vacía");
     throw new Error("apiSet_empty_blocked");
   }
-
-  return await apiCall("set", items);
+  return await apiCall("set", items, { expectedUpdatedAt: Number(expectedUpdatedAt || 0) });
 }
 
 // =====================
@@ -665,6 +708,13 @@ function agregarElemento(texto, completado = false) {
     return;
   }
 
+  // si el usuario re-agrega algo que había borrado, se “perdona” el tombstone
+  const k = keyOf(t);
+  if (tombstones.has(k)) {
+    tombstones.delete(k);
+    saveTombstones(tombstones);
+  }
+
   listaItems.push({ texto: t, completado: !!completado });
   listaItems = dedupNormalize(listaItems);
   localVersion++;
@@ -678,6 +728,11 @@ function eliminarElemento(index) {
 
   const ok = confirm(`¿Eliminar "${item.texto}"?`);
   if (!ok) return;
+
+  // tombstone: borrado intencional (para que el merge no lo re-agregue)
+  tombstones.add(keyOf(item.texto));
+  saveTombstones(tombstones);
+
 
   listaItems.splice(index, 1);
   localVersion++;
@@ -730,48 +785,55 @@ function scheduleSave(reason = "") {
         }
       }
 
-      const prevUA = Number(remoteMeta?.updatedAt || 0);
+      // ===== Guardado con MERGE automático (remoto + local, respetando borrados) =====
+      const before = await apiGet("get");
+      if (before?.ok !== true) {
+        if (before?.error === "auth_required") throw new Error("TOKEN_NEEDS_INTERACTIVE");
+        throw new Error(String(before?.error || "precheck_failed"));
+      }
 
-      await apiSet(listaItems);
+      const remoteItemsNow = Array.isArray(before?.items) ? before.items : [];
+      const remoteUA_now = Number(before?.meta?.updatedAt || 0);
+
+      // merge: remoto + local (local gana), menos tombstones (borrados intencionales)
+      const merged = mergeRemoteWithLocal(remoteItemsNow, listaItems, tombstones);
+
+      // guardamos el merge (ahora sí, aunque tu lista estaba vieja)
+      let saved = await apiSet(merged, remoteUA_now);
+
+      // si el backend devolvió conflicto, re-merge con la versión actual y reintentar 1 vez
+      if (saved?.ok === false && saved?.error === "conflict") {
+        const remote2 = Array.isArray(saved?.items) ? saved.items : [];
+        const ua2 = Number(saved?.meta?.updatedAt || 0);
+        const merged2 = mergeRemoteWithLocal(remote2, listaItems, tombstones);
+        saved = await apiSet(merged2, ua2);
+      }
+
+      if (saved?.ok !== true) {
+        throw new Error(String(saved?.error || "save_failed"));
+      }
+
+      // éxito: actualizamos estado local
+      listaItems = merged;
+      localVersion++;
+      render();
+
+      // ya aplicamos borrados al remoto => limpiamos tombstones
+      tombstones.clear();
+      saveTombstones(tombstones);
+
+      // refrescar meta local
+      remoteMeta = { updatedAt: Number(saved?.meta?.updatedAt || remoteUA_now || 0) };
+      saveCache(listaItems, remoteMeta);
+
       setPending(listaItems);
 
-      // ✅ NO confiar en el GET inmediato: esperar a que updatedAt cambie
-      const confirmed = await waitRemoteUpdate(prevUA, 2500);
-
-      if (!confirmed) {
-        // No confirmamos a tiempo: NO pisamos tu lista local con vacío
-        setSync("ok", "Guardado ✅ (verificando)");
-        if (reason) toast("Guardado ✅", "ok", "Pendiente de confirmación del servidor.");
-        saveCache(listaItems, remoteMeta);
-        // NO borro pending acá para reintentar después automáticamente
-        return;
-      }
-
-      const remoteItems = Array.isArray(confirmed?.items) ? confirmed.items : [];
-      const ua = Number(confirmed?.meta?.updatedAt || 0);
-      const meta = { updatedAt: ua };
-
-
-      // Si hubo cambios mientras guardábamos, no pisar estado local
-      if (localVersion !== startedVersion) {
-        remoteMeta = { updatedAt: Number(meta.updatedAt || 0) };
-        saveCache(listaItems, remoteMeta);
-        setPending(listaItems);
-        setSync("saving", "Guardando…");
-
-        saving = false;
-        scheduleSave("");
-        return;
-      }
-
-      listaItems = dedupNormalize(remoteItems);
-      remoteMeta = { updatedAt: Number(meta.updatedAt || 0) };
-      saveCache(listaItems, remoteMeta);
+      // ✅ Guardado OK: ya aplicamos el MERGE, no necesitamos un GET de confirmación
       clearPending();
-
-      render();
       setSync("ok", "Guardado ✅");
       if (reason) toast("Guardado ✅", "ok", reason);
+      return;
+
     } catch (e) {
       setPending(listaItems);
 
@@ -805,30 +867,41 @@ async function trySyncPending() {
     listaItems = dedupNormalize(pending.items);
     render();
 
-    const prevUA = Number(remoteMeta?.updatedAt || 0);
-
-    await apiSet(listaItems);
-
-    // ✅ Esperar confirmación del server (updatedAt cambia)
-    const confirmed = await waitRemoteUpdate(prevUA, 2500);
-
-    if (!confirmed) {
-      setSync("ok", "Sincronizado ✅ (verificando)");
-      toast("Sincronizado ✅", "ok", "Pendiente confirmación del servidor.");
-      return;
+    const before = await apiGet("get");
+    if (before?.ok !== true) {
+      if (before?.error === "auth_required") throw new Error("TOKEN_NEEDS_INTERACTIVE");
+      throw new Error(String(before?.error || "precheck_failed"));
     }
 
-    const remoteItems = Array.isArray(confirmed?.items) ? confirmed.items : [];
-    const meta = { updatedAt: Number(confirmed?.meta?.updatedAt || 0) };
+    const remoteItemsNow = Array.isArray(before?.items) ? before.items : [];
+    const remoteUA_now = Number(before?.meta?.updatedAt || 0);
 
-    listaItems = dedupNormalize(remoteItems);
-    remoteMeta = { updatedAt: Number(meta.updatedAt || 0) };
+    // merge remoto + pending/local, menos tombstones
+    const merged = mergeRemoteWithLocal(remoteItemsNow, listaItems, tombstones);
+
+    let saved = await apiSet(merged, remoteUA_now);
+    if (saved?.ok === false && saved?.error === "conflict") {
+      const remote2 = Array.isArray(saved?.items) ? saved.items : [];
+      const ua2 = Number(saved?.meta?.updatedAt || 0);
+      const merged2 = mergeRemoteWithLocal(remote2, listaItems, tombstones);
+      saved = await apiSet(merged2, ua2);
+    }
+    if (saved?.ok !== true) throw new Error(String(saved?.error || "save_failed"));
+
+    listaItems = merged;
+    render();
+
+    tombstones.clear();
+    saveTombstones(tombstones);
+
+    remoteMeta = { updatedAt: Number(saved?.meta?.updatedAt || remoteUA_now || 0) };
     saveCache(listaItems, remoteMeta);
     clearPending();
 
-    render();
     setSync("ok", "Sincronizado ✅");
     toast("Sincronizado ✅", "ok", "Se aplicaron cambios pendientes.");
+    return;
+
   } catch (e) {
     if ((e?.message || "") === "TOKEN_NEEDS_INTERACTIVE") {
       setSync("offline", "Necesita Conectar");
@@ -868,6 +941,16 @@ async function refreshFromRemote(showToast = true) {
     }
 
     const remoteItems = Array.isArray(resp?.items) ? resp.items : [];
+
+    // limpiar tombstones que ya no tienen sentido (si remoto ya no tiene ese item)
+    try {
+      const remoteKeys = new Set(remoteItems.map(x => keyOf(x?.texto)).filter(Boolean));
+      for (const k of [...tombstones]) {
+        if (!remoteKeys.has(k)) tombstones.delete(k);
+      }
+      saveTombstones(tombstones);
+    } catch { }
+
     const meta = resp?.meta || { updatedAt: 0 };
 
     // ✅ Si hubo cambios locales mientras cargaba el remoto, NO pisar la lista.
@@ -881,7 +964,7 @@ async function refreshFromRemote(showToast = true) {
       return;
     }
 
-    listaItems = dedupNormalize(remoteItems);
+    listaItems = mergeRemoteWithLocal(remoteItems, [], tombstones);
     remoteMeta = { updatedAt: Number(meta.updatedAt || 0) };
     saveCache(listaItems, remoteMeta);
     render();
