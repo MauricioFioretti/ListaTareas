@@ -142,7 +142,11 @@ function cacheWrite_(data) {
 
 async function forceSwitchAccount() {
   // obliga a Google a mostrar el selector de cuenta
-  clearStoredOAuth();              // 👈 borra localStorage + memoria
+  clearStoredOAuth(); // borra token + email
+
+  // ✅ opcional/recomendado: limpiar caches dependientes de cuenta/sesión
+  try { localStorage.removeItem(LS_SHEET_TITLE); } catch {}
+
   await ensureOAuthToken(true, "select_account");
 }
 
@@ -179,13 +183,21 @@ async function fetchUserEmailFromToken(token) {
   }
 }
 
+// ✅ Evita carreras: GIS usa un solo callback. Si dos requestAccessToken corren juntos,
+// se pisan y queda todo inestable (muy común en incógnito con auto-refresh + save + retry).
+let oauthTokenRequestInFlight = null;
+
 function requestAccessToken({ prompt, hint } = {}) {
-  return new Promise((resolve, reject) => {
+  // Si ya hay una solicitud en vuelo, devolvemos la misma Promise
+  if (oauthTokenRequestInFlight) return oauthTokenRequestInFlight;
+
+  oauthTokenRequestInFlight = new Promise((resolve, reject) => {
     let done = false;
 
     const timer = setTimeout(() => {
       if (done) return;
       done = true;
+      oauthTokenRequestInFlight = null;
       reject(new Error("popup_timeout_or_closed"));
     }, 45_000);
 
@@ -193,14 +205,20 @@ function requestAccessToken({ prompt, hint } = {}) {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      oauthTokenRequestInFlight = null;
 
       if (resp?.error) {
-        // GIS suele devolver interaction_required cuando pedís silent
         const err = String(resp.error || "");
         const sub = String(resp.error_subtype || "");
         const msg = (err + (sub ? `:${sub}` : "")).toLowerCase();
 
-        if (msg.includes("interaction_required") || msg.includes("access_denied")) {
+        // Normalizamos casos típicos de “silent no permitido”
+        if (
+          msg.includes("interaction_required") ||
+          msg.includes("access_denied") ||
+          msg.includes("popup_closed") ||
+          msg.includes("popup_closed_by_user")
+        ) {
           reject(new Error("TOKEN_NEEDS_INTERACTIVE"));
           return;
         }
@@ -208,16 +226,24 @@ function requestAccessToken({ prompt, hint } = {}) {
         reject(new Error(err));
         return;
       }
-      resolve(resp);
 
+      resolve(resp);
     };
 
-    // Si prompt viene undefined, NO lo mandamos (GIS a veces se pone pesado si mandás "")
     const opts = {};
-    if (prompt !== undefined) opts.prompt = prompt;
+    if (prompt !== undefined) opts.prompt = prompt; // "" = silent real
     if (hint && hint.includes("@")) opts.hint = hint;
-    oauthTokenClient.requestAccessToken(opts);
+
+    try {
+      oauthTokenClient.requestAccessToken(opts);
+    } catch (e) {
+      clearTimeout(timer);
+      oauthTokenRequestInFlight = null;
+      reject(e);
+    }
   });
+
+  return oauthTokenRequestInFlight;
 }
 
 function isTokenValid() {
@@ -226,6 +252,8 @@ function isTokenValid() {
 
 // Esto intenta silent. Si falla y allowInteractive=true, abre popup.
 // Esto intenta silent SIEMPRE primero. Si falla y allowInteractive=true, abre popup.
+// Esto intenta silent. Si falla y allowInteractive=true, abre popup.
+// ✅ Anti-incógnito: si el token silent viene de OTRO email distinto al hint, se invalida.
 async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "consent") {
   // 1) si ya está en memoria, OK
   if (isTokenValid()) return oauthAccessToken;
@@ -236,9 +264,23 @@ async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "c
 
   const hintEmail = loadStoredOAuthEmail();
 
-  // ✅ CORTE: si NO es interactivo y NO había nada guardado, NO llames GIS
+  // ✅ CORTE incógnito:
+  // Si NO es interactivo y NO había token guardado y NO hay hint => NO llames GIS (evita loops raros)
   if (!allowInteractive && !hadStored && !hintEmail) {
     throw new Error("TOKEN_NEEDS_INTERACTIVE");
+  }
+
+  // Helper: valida que el token corresponda al email esperado (si hay hint)
+  async function validateTokenEmailOrThrow_() {
+    if (!hintEmail) return;
+    const em = await fetchUserEmailFromToken(oauthAccessToken);
+    if (!em) return; // si no se pudo leer userinfo, no bloqueamos acá
+
+    if (em !== hintEmail) {
+      // token de otra cuenta: limpiamos para no quedar pegados a la equivocada
+      clearStoredOAuth();
+      throw new Error("TOKEN_NEEDS_INTERACTIVE");
+    }
   }
 
   // 3) Silent real (prompt:"")
@@ -246,40 +288,53 @@ async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "c
     console.log("[ensureOAuthToken] silent refresh, hint =", hintEmail);
 
     const r = await requestAccessToken({
-      prompt: "",                 // ✅ silent real estilo Drive XL
+      prompt: "",
       hint: hintEmail || undefined
     });
 
     if (r?.access_token) {
       oauthAccessToken = r.access_token;
-      oauthExpiresAt = Date.now() + (r.expires_in * 1000);
-      saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
+      oauthExpiresAt = Date.now() + (Number(r.expires_in || 3600) * 1000);
 
-      // 🔑 Guardar email como hint (no depende de backend)
+      // Guardamos token y validamos mismatch (si hay hint)
+      saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
+      await validateTokenEmailOrThrow_();
+
+      // Guardar email como hint (si lo conseguimos)
       const em = await fetchUserEmailFromToken(oauthAccessToken);
       if (em) saveStoredOAuthEmail(em);
 
       return oauthAccessToken;
     }
   } catch (e) {
-    console.warn("[ensureOAuthToken] silent refresh failed:", e?.message || e);
+    const msg = String(e?.message || e || "");
+    console.warn("[ensureOAuthToken] silent refresh failed:", msg);
+
+    if (!allowInteractive) {
+      throw new Error("TOKEN_NEEDS_INTERACTIVE");
+    }
   }
 
   // 4) Interactivo
-  if (allowInteractive) {
-    const r = await requestAccessToken({ prompt: interactivePrompt ?? "consent" });
-    oauthAccessToken = r.access_token;
-    oauthExpiresAt = Date.now() + (r.expires_in * 1000);
-    saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
+  // ✅ En primer uso/incógnito, preferimos select_account si no hay hint
+  const promptToUse = interactivePrompt ?? "consent";
+  const finalPrompt = (!hintEmail && promptToUse === "consent") ? "select_account" : promptToUse;
 
-    // 🔑 también acá
-    const em = await fetchUserEmailFromToken(oauthAccessToken);
-    if (em) saveStoredOAuthEmail(em);
+  const r2 = await requestAccessToken({
+    prompt: finalPrompt,
+    hint: hintEmail || undefined
+  });
 
-    return oauthAccessToken;
-  }
+  if (!r2?.access_token) throw new Error("TOKEN_NEEDS_INTERACTIVE");
 
-  throw new Error("TOKEN_NEEDS_INTERACTIVE");
+  oauthAccessToken = r2.access_token;
+  oauthExpiresAt = Date.now() + (Number(r2.expires_in || 3600) * 1000);
+  saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
+
+  const em2 = await fetchUserEmailFromToken(oauthAccessToken);
+  if (em2) saveStoredOAuthEmail(em2);
+
+  return oauthAccessToken;
 }
 
 // =====================
@@ -433,6 +488,8 @@ btnRefresh.addEventListener("click", async () => {
 });
 
 btnConnect.addEventListener("click", async () => {
+  uiBusyStart("btnConnect_click");
+
   try {
     setSync("saving", "Autorizando…");
 
@@ -443,8 +500,8 @@ btnConnect.addEventListener("click", async () => {
     if (isSwitch) {
       await forceSwitchAccount(); // limpia y abre selector (select_account)
     } else {
-      // SIEMPRE mostrar selector para evitar quedar pegado a la última cuenta (no autorizada)
-      await ensureOAuthToken(true, "consent");
+      // ✅ En incógnito conviene SIEMPRE select_account para no quedar pegado a otra cuenta
+      await ensureOAuthToken(true, "select_account");
     }
 
     // 2) (rápido) Validación directa: email desde token (sin backend)
@@ -456,9 +513,6 @@ btnConnect.addEventListener("click", async () => {
     } else {
       setAccountUI(loadStoredOAuthEmail());
     }
-
-    // 3) (ya seteado) email desde token (sin backend)
-    //    No hacemos whoami acá para evitar latencia
 
     // 4) Conectado OK → ahora sí cargamos la lista real desde Sheets (rápido)
     await refreshFromRemote(true);
@@ -478,10 +532,10 @@ btnConnect.addEventListener("click", async () => {
     setSync("offline", "No autorizado");
     setAccountUI("");
     toast("No se pudo conectar", "err", msg);
+  } finally {
+    uiBusyEnd("btnConnect_click");
   }
 });
-
-
 
 const main = document.querySelector("main");
 
@@ -607,15 +661,63 @@ async function waitRemoteUpdate(prevUpdatedAt, timeoutMs = 2500) {
 let localVersion = 0;
 
 // =====================
+// User-gesture marker (permite pedir token interactivo si falla por scopes/permisos)
+// =====================
+let lastUserGestureAt = 0;
+
+// ✅ En incógnito / redes lentas, 2.5s a veces no alcanza para llegar al error y fallback interactivo.
+// Subimos a 15s para que, si el save falla por permisos, podamos abrir select_account.
+const USER_GESTURE_TTL_MS = 15000;
+
+function markUserGesture_() {
+  lastUserGestureAt = Date.now();
+}
+
+function canUseInteractiveNow_() {
+  return (Date.now() - lastUserGestureAt) <= USER_GESTURE_TTL_MS;
+}
+
+// =====================
 // UI helpers
 // =====================
+
+// --- UI guard: evita que aparezca "Necesita Conectar" mientras estamos conectando/sincronizando ---
+let uiBusyCount = 0;
+
+function uiBusyStart(label = "") {
+  uiBusyCount++;
+  // console.log("[uiBusyStart]", label, "count=", uiBusyCount);
+}
+
+function uiBusyEnd(label = "") {
+  uiBusyCount = Math.max(0, uiBusyCount - 1);
+  // console.log("[uiBusyEnd]", label, "count=", uiBusyCount);
+}
+
+function uiIsBusy() {
+  return uiBusyCount > 0;
+}
+
 function setSync(state, text) {
+  const nextState = state || "";
+  const nextText = String(text || "");
+
+  // ✅ Guard anti-parpadeo:
+  // Si estamos en medio de una conexión/reconexión/sync, NO mostrar "Necesita Conectar"
+  // porque es un "downgrade" temporal que después se corrige solo.
+  const isNeedsConnect = (nextState === "offline") && /necesita conectar/i.test(nextText);
+
+  if (isNeedsConnect && uiIsBusy()) {
+    // No tocamos el pill ni mostramos refresh durante un flujo "busy"
+    return;
+  }
+
   syncPill.classList.remove("ok", "saving", "offline");
-  if (state) syncPill.classList.add(state);
-  syncPill.querySelector(".sync-text").textContent = text;
+  if (nextState) syncPill.classList.add(nextState);
+  syncPill.querySelector(".sync-text").textContent = nextText;
 
   // Mostrar refresh solo cuando estamos "offline / necesita conectar"
-  const needs = (state === "offline") && /necesita conectar/i.test(String(text || ""));
+  const needs = (nextState === "offline") && /necesita conectar/i.test(nextText);
   if (btnRefresh) btnRefresh.style.display = needs ? "inline-block" : "none";
 }
 
@@ -753,7 +855,7 @@ function saveCache(items, meta = {}) {
   try {
     localStorage.setItem(LS_CACHE, JSON.stringify({
       items,
-      meta: { updatedAt: meta.updatedAt || 0, ts: Date.now() }
+      meta: { updatedAt: meta.updatedAt || 0, count: meta.count || 0, ts: Date.now() }
     }));
   } catch { }
 }
@@ -869,31 +971,28 @@ async function sheetsGet_(token) {
 
 // Escribe toda la lista A2:B + Z1 (batchUpdate)
 // expectedUpdatedAt: si no coincide => conflict
+// Escribe toda la lista A2:B + Z1 (batchUpdate)
+// expectedUpdatedAt: si no coincide => conflict
 async function sheetsSet_(token, items, expectedUpdatedAt = 0) {
   const sheetTitle = await resolveSheetTitleFromGid_(token);
 
-  // 1) leer meta actual (solo Z1) para conflicto rápido
-  const urlMeta =
-    `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(SPREADSHEET_ID)}` +
-    `/values/${encodeURIComponent(sheetTitle + "!" + META_CELL_A1)}?majorDimension=ROWS`;
+  // ✅ 1) UN SOLO GET para conflicto + remoteCount (A2:B + Z1)
+  const before = await sheetsGet_(token);
+  if (!before?.ok) return before;
 
-  const metaResp = await fetchJson_(urlMeta, token);
-  if (!metaResp?.r?.ok) {
-    const cls = classifyGoogleApiError_(metaResp);
-    return { ok: false, error: cls.error, status: metaResp.status, detail: String(metaResp.text || "").slice(0, 1000) };
-  }
+  const remoteUA = Number(before?.meta?.updatedAt || 0);
+  const remoteCount = Number(before?.meta?.count || 0);
 
-  const remoteUA = Number(metaResp?.json?.values?.[0]?.[0] || 0);
   if (Number(expectedUpdatedAt || 0) !== remoteUA) {
-    // conflicto: devolvemos remoto completo para merge (como en Compras)
-    const full = await sheetsGet_(token);
-    if (full?.ok) {
-      return { ok: false, error: "conflict", items: full.items, meta: full.meta };
-    }
-    return { ok: false, error: "conflict", items: [], meta: { updatedAt: remoteUA, count: 0 } };
+    return {
+      ok: false,
+      error: "conflict",
+      items: Array.isArray(before?.items) ? before.items : [],
+      meta: before?.meta || { updatedAt: remoteUA, count: remoteCount }
+    };
   }
 
-  // 2) normalizar/dedup/ordenar (misma idea que Compras)
+  // ✅ 2) normalizar/dedup/ordenar
   let clean = (items || [])
     .map(it => ({ texto: (it?.texto || "").toString().trim(), completado: !!it?.completado }))
     .filter(it => it.texto !== "");
@@ -913,11 +1012,7 @@ async function sheetsSet_(token, items, expectedUpdatedAt = 0) {
 
   if (clean.length === 0) return { ok: false, error: "empty_list_blocked" };
 
-  // 3) preparar values
-  // Para limpiar sobrantes, leemos count remoto (del get rápido) una vez
-  const before = await sheetsGet_(token);
-  const remoteCount = Number(before?.meta?.count || 0);
-
+  // ✅ 3) preparar values (limpia sobrantes usando remoteCount que ya vino en "before")
   const nextUA = Date.now();
   const maxLen = Math.max(remoteCount, clean.length);
 
@@ -956,7 +1051,11 @@ async function sheetsSet_(token, items, expectedUpdatedAt = 0) {
 // Interfaz “apiCall/apiGet/apiSet” para que el resto de tu código cambie lo mínimo
 async function apiCall(mode, items, extra = {}, { allowInteractive = false } = {}) {
   // 1) token
-  const token = await ensureOAuthToken(allowInteractive, allowInteractive ? "consent" : "consent");
+  // ✅ Si no hay hintEmail (típico incógnito), cuando sea interactivo usamos select_account
+  const hint = loadStoredOAuthEmail();
+  const prompt = allowInteractive ? (hint ? "consent" : "select_account") : "consent";
+
+  const token = await ensureOAuthToken(allowInteractive, prompt);
 
   // 2) modos
   const m = String(mode || "").toLowerCase();
@@ -1018,22 +1117,38 @@ async function reconnectAndRefresh({ showToast = true } = {}) {
   if (reconnecting) return;
   reconnecting = true;
 
+  uiBusyStart("reconnectAndRefresh");
+
   try {
     setSync("saving", "Reconectando…");
 
     // 1) Intento SILENT (no popup)
     await ensureOAuthToken(false);
 
-    // 2) Email desde token (sin backend)
-    const em = await fetchUserEmailFromToken(oauthAccessToken);
-    if (em) {
-      saveStoredOAuthEmail(em);
-      setAccountUI(em);
-    } else {
-      setAccountUI(loadStoredOAuthEmail());
+    // 2) Detectar email real del token
+    const tokenEmail = await fetchUserEmailFromToken(oauthAccessToken);
+    const hintedEmail = loadStoredOAuthEmail();
+
+    // ✅ En incógnito, a veces el silent devuelve token de otra cuenta.
+    // Si tengo "hint" guardado y el token viene con otro email, no sigo:
+    if (hintedEmail && tokenEmail && tokenEmail !== hintedEmail) {
+      // Dejamos consistente el estado (y obligamos selector al usuario)
+      clearStoredOAuth();
+      setAccountUI("");
+      setSync("offline", "Necesita Conectar");
+      if (showToast) toast("Cuenta incorrecta", "warn", "Tocá Conectar y elegí la cuenta con acceso.");
+      return;
     }
 
-    // 3) Traer lista real (Sheets API)
+    // 3) Guardar email como hint y reflejar en UI
+    if (tokenEmail) {
+      saveStoredOAuthEmail(tokenEmail);
+      setAccountUI(tokenEmail);
+    } else {
+      setAccountUI(hintedEmail);
+    }
+
+    // 4) Traer lista real (Sheets API)
     await refreshFromRemote(false);
 
     setSync("ok", "Conectado ✅");
@@ -1050,6 +1165,7 @@ async function reconnectAndRefresh({ showToast = true } = {}) {
     setSync("offline", "Necesita Conectar");
     if (showToast) toast("No se pudo reconectar", "err", msg);
   } finally {
+    uiBusyEnd("reconnectAndRefresh");
     reconnecting = false;
   }
 }
@@ -1075,6 +1191,7 @@ function render() {
     tick.checked = !!item.completado;
 
     tick.addEventListener("change", () => {
+      markUserGesture_(); // ✅ marca gesto real del usuario (permite popup si falta scope)
       item.completado = tick.checked;
       listaItems = dedupNormalize(listaItems);
       localVersion++;
@@ -1209,6 +1326,10 @@ async function scheduleRetry(label = "") {
 }
 
 function scheduleSave(reason = "") {
+  // ✅ Si esto vino de una acción del usuario (reason no vacío),
+  // marcamos gesto para permitir popup si hace falta (incógnito / cuenta equivocada)
+  if (reason) markUserGesture_();
+
   // guardamos cache SIEMPRE (UI instantánea)
   saveCache(listaItems, remoteMeta);
 
@@ -1246,12 +1367,8 @@ function scheduleSave(reason = "") {
     const localSnapshot = dedupNormalize(listaItems); // lo que queremos persistir
 
     try {
-      // ✅ OPTIMISTIC SAVE (igual que Lista de compras):
-      // usamos updatedAt que ya tenemos; si está viejo => conflict y re-merge
       const expectedUA = Number(remoteMeta?.updatedAt || 0);
 
-      // merge “seguro” sin remoto (si hay conflicto, re-mergeamos con remoto real)
-      // OJO: usamos snapshot, no listaItems viva
       const merged = mergeRemoteWithLocal([], localSnapshot, tombstones);
 
       if (merged.length === 0) {
@@ -1261,52 +1378,81 @@ function scheduleSave(reason = "") {
         return;
       }
 
-      // 1er intento (sin popup)
+      // ✅ Si el último evento fue un gesto real del usuario, permitimos fallback interactivo
+      const allowInteractive = canUseInteractiveNow_();
+
+      // 1) primer intento (silencioso)
       let saved = await apiSet(merged, expectedUA, { allowInteractive: false });
 
-      // conflicto => backend nos devuelve items + meta actual, re-merge y reintento 1 vez
+      // 2) Si falla por auth/scope -> pedir interacción (consent)
+      if (saved?.ok === false && (saved?.error === "auth_required" || saved?.error === "missing_scope")) {
+        if (!allowInteractive) throw new Error("TOKEN_NEEDS_INTERACTIVE");
+        saved = await apiSet(merged, expectedUA, { allowInteractive: true });
+      }
+
+      // 3) ✅ Si falla por "permission_denied" o "not_found_or_no_access",
+      // en incógnito suele ser cuenta equivocada -> forzar selector de cuenta
+      if (saved?.ok === false && (saved?.error === "permission_denied" || saved?.error === "not_found_or_no_access")) {
+        if (!allowInteractive) throw new Error("TOKEN_NEEDS_INTERACTIVE");
+
+        // Fuerza selector de cuenta (select_account) y reintenta una vez
+        await forceSwitchAccount();
+        saved = await apiSet(merged, expectedUA, { allowInteractive: true });
+      }
+
+      // conflicto => re-merge y reintento 1 vez
       if (saved?.ok === false && saved?.error === "conflict") {
         const remoteItemsNow = Array.isArray(saved?.items) ? saved.items : [];
         const remoteUA = Number(saved?.meta?.updatedAt || 0);
 
         const merged2 = mergeRemoteWithLocal(remoteItemsNow, localSnapshot, tombstones);
-        const saved2 = await apiSet(merged2, remoteUA, { allowInteractive: false });
+
+        let saved2 = await apiSet(merged2, remoteUA, { allowInteractive: false });
+
+        // auth/scope -> consent
+        if (saved2?.ok === false && (saved2?.error === "auth_required" || saved2?.error === "missing_scope")) {
+          if (!allowInteractive) throw new Error("TOKEN_NEEDS_INTERACTIVE");
+          saved2 = await apiSet(merged2, remoteUA, { allowInteractive: true });
+        }
+
+        // ✅ permiso/no access -> selector de cuenta
+        if (saved2?.ok === false && (saved2?.error === "permission_denied" || saved2?.error === "not_found_or_no_access")) {
+          if (!allowInteractive) throw new Error("TOKEN_NEEDS_INTERACTIVE");
+          await forceSwitchAccount();
+          saved2 = await apiSet(merged2, remoteUA, { allowInteractive: true });
+        }
 
         if (saved2?.ok !== true) throw new Error(String(saved2?.error || "save_failed"));
 
         saved = saved2;
-
-        // ✅ IMPORTANTE:
-        // NO asignamos listaItems acá todavía (para no pisar clicks nuevos)
-        // Solo guardamos el "resultado final que se guardó"
         var finalSavedItems = dedupNormalize(merged2);
+
       } else {
         if (saved?.ok !== true) {
           if (saved?.error === "auth_required") throw new Error("TOKEN_NEEDS_INTERACTIVE");
           throw new Error(String(saved?.error || "save_failed"));
         }
 
-        // también: no tocar listaItems todavía
         var finalSavedItems = dedupNormalize(merged);
       }
 
-      // ✅ CLAVE (igual que Lista de compras):
-      // si hubo cambios mientras guardábamos, NO pisar estado local
+      // ✅ Si hubo cambios mientras guardábamos, NO pisar estado local
       if (localVersion !== startedVersion) {
-        setPending(listaItems);          // dejamos la versión más nueva en cola
+        setPending(listaItems);
         setSync("saving", "Guardando…");
         saving = false;
-        scheduleSave("");                // reintenta con lo último
+        scheduleSave("");
         return;
       }
 
-      // ✅ Recién ahora podemos aplicar normalización local (sin perder clicks)
+      // ✅ Aplicar resultado final
       listaItems = finalSavedItems;
 
-      // éxito: actualizar meta desde backend
-      remoteMeta = { updatedAt: Number(saved?.meta?.updatedAt || remoteMeta?.updatedAt || 0) };
+      remoteMeta = {
+        updatedAt: Number(saved?.meta?.updatedAt || remoteMeta?.updatedAt || 0),
+        count: Number(saved?.meta?.count || remoteMeta?.count || 0)
+      };
 
-      // ya aplicamos borrados al remoto => limpiamos tombstones
       tombstones.clear();
       saveTombstones(tombstones);
 
@@ -1328,7 +1474,6 @@ function scheduleSave(reason = "") {
       } else {
         setSync("offline", "No se pudo guardar — Queda en cola");
         toast("No se pudo guardar", "err", msg || "Quedó pendiente.");
-        // ✅ reintento automático como Lista de compras (lo agregamos en el CAMBIO 2)
         scheduleRetry("save_failed");
       }
 
@@ -1336,7 +1481,7 @@ function scheduleSave(reason = "") {
       saving = false;
     }
 
-  }, 250); // ✅ más “instantáneo” (en compras lo sentís rápido). Ajustable.
+  }, 250);
 }
 
 async function trySyncPending() {
@@ -1383,7 +1528,11 @@ async function trySyncPending() {
     tombstones.clear();
     saveTombstones(tombstones);
 
-    remoteMeta = { updatedAt: Number(saved?.meta?.updatedAt || remoteUA_now || 0) };
+    remoteMeta = {
+      updatedAt: Number(saved?.meta?.updatedAt || remoteUA_now || 0),
+      count: Number(saved?.meta?.count || remoteMeta?.count || 0)
+    };
+
     saveCache(listaItems, remoteMeta);
     clearPending();
 
@@ -1413,12 +1562,24 @@ async function refreshFromRemote(showToast = true) {
     return;
   }
 
+  uiBusyStart("refreshFromRemote");
+
   try {
     // ✅ Traer remoto + meta REAL (Z1)
     const resp = await apiCall("get", null, {}, { allowInteractive: false });
 
     if (!resp?.ok) {
+      // auth => pedir conectar
       if (resp?.error === "auth_required") throw new Error("TOKEN_NEEDS_INTERACTIVE");
+
+      // ✅ CLAVE incógnito: si la cuenta no tiene acceso (403/404),
+      // limpiamos estado para obligar a elegir otra cuenta con permisos.
+      if (resp?.error === "permission_denied" || resp?.error === "not_found_or_no_access") {
+        clearStoredOAuth();
+        setAccountUI("");
+        throw new Error("TOKEN_NEEDS_INTERACTIVE");
+      }
+
       throw new Error(String(resp?.error || "get_failed"));
     }
 
@@ -1427,7 +1588,11 @@ async function refreshFromRemote(showToast = true) {
 
     // ✅ Si hubo cambios locales mientras cargaba, no pisar UI
     if (localVersion !== startedVersion) {
-      remoteMeta = { updatedAt: Number(meta.updatedAt || 0) };
+      remoteMeta = {
+        updatedAt: Number(meta.updatedAt || 0),
+        count: Number(meta.count || 0)
+      };
+
       saveCache(listaItems, remoteMeta);
       setSync("ok", "Cambios locales ✅");
       if (showToast) toast("Cambios locales detectados", "warn", "No se reemplazó tu lista por la versión remota.");
@@ -1437,7 +1602,11 @@ async function refreshFromRemote(showToast = true) {
     // merge remoto - tombstones (como ya hacías)
     listaItems = mergeRemoteWithLocal(remoteItems, [], tombstones);
 
-    remoteMeta = { updatedAt: Number(meta.updatedAt || 0) };
+    remoteMeta = {
+      updatedAt: Number(meta.updatedAt || 0),
+      count: Number(meta.count || 0)
+    };
+
     saveCache(listaItems, remoteMeta);
     render();
 
@@ -1448,6 +1617,7 @@ async function refreshFromRemote(showToast = true) {
     const msg = String(e?.message || "");
 
     if (msg === "TOKEN_NEEDS_INTERACTIVE") {
+      // ✅ Este setSync ya no va a parpadear si estamos busy
       setSync("offline", "Necesita Conectar");
       if (showToast) toast("Necesitás autorizar", "warn", "Tocá el botón Conectar.");
       return;
@@ -1455,6 +1625,8 @@ async function refreshFromRemote(showToast = true) {
 
     setSync("offline", "No se pudo cargar — usando cache");
     if (showToast) toast("No se pudo cargar", "warn", "Mostrando la última versión guardada.");
+  } finally {
+    uiBusyEnd("refreshFromRemote");
   }
 }
 
@@ -1666,10 +1838,25 @@ window.addEventListener("load", async () => {
   startTokenAutoRefresh();
 
   // DEBUG: forzar expiración para probar refresh silencioso
+  // Uso:
+  //   __expireTokenNow()           -> solo expira
+  //   __expireAndReconnect()       -> expira y fuerza reconnectAndRefresh
   window.__expireTokenNow = () => {
     oauthExpiresAt = Date.now() - 1000;
     saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
     console.log("Token forzado a expirar.");
+  };
+
+  window.__expireAndReconnect = async () => {
+    window.__expireTokenNow();
+
+    console.log("Probando reconexión automática…");
+    try {
+      await reconnectAndRefresh({ showToast: true });
+      console.log("Reconexión OK ✅");
+    } catch (e) {
+      console.warn("Reconexión falló:", e?.message || e);
+    }
   };
 
   // Si la pestaña vuelve a estar visible y estamos en "Necesita Conectar", reintentar silent
