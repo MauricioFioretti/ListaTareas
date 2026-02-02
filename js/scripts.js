@@ -1,8 +1,22 @@
-// =====================
-// CONFIG API (Apps Script Web App)
-// =====================
-// ⚠️ Pegá acá el /exec de tu Web App (Deploy)
-const API_BASE = "https://script.google.com/macros/s/AKfycbzHOg58y2GFbPZijSmMX567cOYvpbZ3PTLbd7qAKwcmu9EyzbuKseIymW9eaG_6Tjfo9w/exec"; // ej: https://script.google.com/macros/s/XXXXX/exec
+// ================== CONFIG (Sheets API directo) ==================
+// ✅ Spreadsheet de "Lista tareas"
+const SPREADSHEET_ID = "1pDZcf3ca_6_3pDolWWCY4P0132sv9VVjRSL6O6-EIo0";
+
+// ✅ Meta cell (para control de versiones tipo "Lista de compras")
+const META_CELL_A1 = "Z1";
+
+// ✅ GID de la hoja (lo que viene en la URL: ...edit?gid=XXXX)
+const SHEET_GID = 1308790294;
+
+// Cache del título de hoja resuelto desde el GID (evita pedir metadata siempre)
+const LS_SHEET_TITLE = "lista_tareas_sheet_title_v1";
+
+// Cache de datos para render instantáneo
+const LS_CACHE_DATA = "lista_tareas_cache_data_v1";
+const LS_CACHE_TS   = "lista_tareas_cache_ts_v1";
+
+// TTL cache (ej: 60s). Ajustalo si querés.
+const CACHE_TTL_MS = 60_000;
 
 // =====================
 // CONFIG OAUTH (Google Identity Services)
@@ -15,9 +29,116 @@ const OAUTH_CLIENT_ID = "917192108969-6d693ji2l5ku1vsje8s6brvio2j01hio.apps.goog
 const OAUTH_SCOPES =
   "openid email profile " +
   "https://www.googleapis.com/auth/userinfo.email " +
-  "https://www.googleapis.com/auth/userinfo.profile " +   // 👈 espacio al final
+  "https://www.googleapis.com/auth/userinfo.profile " +
+  // ✅ necesario para leer/escribir la planilla directo (Sheets API)
+  "https://www.googleapis.com/auth/spreadsheets " +
+  // ✅ opcional (lo dejás si tu backend usa allowlist con drive metadata)
   "https://www.googleapis.com/auth/drive.metadata.readonly";
 
+  // ================== SHEETS API HELPERS (rápido) ==================
+
+// Resuelve el título real de la pestaña usando el SHEET_GID (sheetId)
+// y lo guarda en localStorage para no pedirlo siempre.
+async function resolveSheetTitleFromGid_(accessToken) {
+  // 1) cache
+  try {
+    const cached = (localStorage.getItem(LS_SHEET_TITLE) || "").trim();
+    if (cached) return cached;
+  } catch {}
+
+  // 2) pedir metadata mínima
+  const url =
+    `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(SPREADSHEET_ID)}` +
+    `?fields=sheets(properties(sheetId,title))`;
+
+  const r = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+  const txt = await r.text();
+  if (!r.ok) throw new Error("sheet_meta_failed: " + txt.slice(0, 300));
+
+  const json = JSON.parse(txt);
+  const sheets = Array.isArray(json?.sheets) ? json.sheets : [];
+
+  const found = sheets.find(s => Number(s?.properties?.sheetId) === Number(SHEET_GID));
+  const title = (found?.properties?.title || "").toString().trim();
+  if (!title) throw new Error("sheet_title_not_found_for_gid");
+
+  try { localStorage.setItem(LS_SHEET_TITLE, title); } catch {}
+  return title;
+}
+
+// Lee headers + datos en 1 request (batchGet)
+async function sheetsBatchGet_(accessToken, sheetTitle) {
+  const sheetEsc = encodeURIComponent(sheetTitle);
+
+  // Row 1 = headers; Row 2.. = data
+  const url =
+    `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(SPREADSHEET_ID)}` +
+    `/values:batchGet?ranges=${sheetEsc}!1:1&ranges=${sheetEsc}!2:9999&majorDimension=ROWS`;
+
+  const r = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+
+  const txt = await r.text();
+  if (!r.ok) throw new Error("list_failed: " + txt.slice(0, 400));
+
+  const json = JSON.parse(txt);
+  const ranges = Array.isArray(json?.valueRanges) ? json.valueRanges : [];
+
+  const headerValues = ranges?.[0]?.values?.[0] || [];
+  const dataValues = ranges?.[1]?.values || [];
+
+  const headers = headerValues.map(h => (h || "").toString().trim());
+  return { headers, rows: dataValues };
+}
+
+// Convierte rows -> objetos según headers
+function rowsToObjects_(headers, rows) {
+  const out = [];
+  const safeHeaders = (headers || []).map(h => (h || "").toString().trim());
+
+  for (let i = 0; i < (rows || []).length; i++) {
+    const r = rows[i];
+    if (!Array.isArray(r)) continue;
+
+    // si está totalmente vacía, saltearla
+    const hasAny = r.some(c => (c || "").toString().trim() !== "");
+    if (!hasAny) continue;
+
+    const obj = {};
+    for (let j = 0; j < safeHeaders.length; j++) {
+      const h = safeHeaders[j];
+      if (!h) continue;
+      obj[h] = (r[j] ?? "").toString();
+    }
+
+    // ✅ fila real en sheet: data empieza en fila 2
+    obj.__rowNumber = 2 + i;
+
+    out.push(obj);
+  }
+  return out;
+}
+
+// Cache local: guardar/leer
+function cacheRead_() {
+  try {
+    const ts = Number(localStorage.getItem(LS_CACHE_TS) || "0");
+    const raw = localStorage.getItem(LS_CACHE_DATA);
+    if (!raw) return null;
+    return { ts, data: JSON.parse(raw) };
+  } catch {
+    return null;
+  }
+}
+function cacheWrite_(data) {
+  try {
+    localStorage.setItem(LS_CACHE_DATA, JSON.stringify(data));
+    localStorage.setItem(LS_CACHE_TS, String(Date.now()));
+  } catch {}
+}
 
 async function forceSwitchAccount() {
   // obliga a Google a mostrar el selector de cuenta
@@ -326,25 +447,20 @@ btnConnect.addEventListener("click", async () => {
       await ensureOAuthToken(true, "consent");
     }
 
-
-    // 2) VALIDAMOS contra backend (allowlist real)
-    const r = await verifyBackendAccessOrThrow();
-
-    // 3) whoami (para mostrar email y guardar hint)
-    try {
-      const who = await apiGet("whoami");
-      if (who?.ok === true && who.email) {
-        saveStoredOAuthEmail(who.email);
-        setAccountUI(who.email);
-        console.log("Email guardado para hint:", who.email);
-      } else {
-        setAccountUI(loadStoredOAuthEmail());
-      }
-    } catch {
+    // 2) (rápido) Validación directa: email desde token (sin backend)
+    const em = await fetchUserEmailFromToken(oauthAccessToken);
+    if (em) {
+      saveStoredOAuthEmail(em);
+      setAccountUI(em);
+      console.log("Email guardado para hint:", em);
+    } else {
       setAccountUI(loadStoredOAuthEmail());
     }
 
-    // 4) Conectado OK → ahora sí cargamos la lista real desde backend
+    // 3) (ya seteado) email desde token (sin backend)
+    //    No hacemos whoami acá para evitar latencia
+
+    // 4) Conectado OK → ahora sí cargamos la lista real desde Sheets (rápido)
     await refreshFromRemote(true);
 
     setSync("ok", "Conectado ✅");
@@ -562,6 +678,34 @@ function dedupNormalize(items) {
   return ordenarLista(out);
 }
 
+// =====================
+// Sheets -> items {texto, completado}
+// =====================
+function sheetsObjectsToListaItems_(objs) {
+  // objs: [{Texto:"...", Completado:"TRUE", ...}, ...]
+  // soporta distintos nombres de columnas
+  const out = [];
+
+  for (const o of (objs || [])) {
+    // posibles nombres para texto
+    const texto =
+      (o?.texto ?? o?.Texto ?? o?.Tarea ?? o?.tarea ?? o?.Item ?? o?.item ?? "").toString().trim();
+
+    if (!texto) continue;
+
+    // posibles nombres para completado
+    const rawDone =
+      (o?.completado ?? o?.Completado ?? o?.done ?? o?.Done ?? o?.Estado ?? o?.estado ?? "").toString().trim().toLowerCase();
+
+    const completado =
+      rawDone === "true" || rawDone === "1" || rawDone === "sí" || rawDone === "si" || rawDone === "x" || rawDone === "checked";
+
+    out.push({ texto, completado });
+  }
+
+  return dedupNormalize(out);
+}
+
 function keyOf(texto) {
   return normalizarTexto(texto).toLowerCase();
 }
@@ -637,101 +781,232 @@ function isOnline() {
 }
 
 // =====================
-// API: GET con CORS (sin JSONP)
-// =====================
-// =====================
-// API: GET por JSONP (evita CORS de Apps Script)
-// =====================
-// =====================
-// API (sin token en URL)
-// - Usamos POST text/plain para evitar preflight
-// - El backend devuelve JSON normal
+// API (Sheets API directo) ✅ (como Lista de Compras)
+// - get: lee A2:B + meta Z1
+// - set: escribe A2:B + meta Z1 con control de conflicto por updatedAt
 // =====================
 
-async function apiCall(mode, items, extra = {}, { allowInteractive = false, retry = true } = {}) {
-  let token = "";
-
-  try {
-    token = await ensureOAuthToken(allowInteractive, allowInteractive ? "consent" : "consent");
-  } catch {
-    throw new Error("TOKEN_NEEDS_INTERACTIVE");
-  }
-
-  const payload = { mode, access_token: token, ...extra };
-  if (items) payload.items = items;
-
-  let r = await fetch(API_BASE, {
-    method: "POST",
-    headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify(payload)
+async function fetchJson_(url, token, options = {}) {
+  const r = await fetch(url, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      ...(options.headers || {})
+    },
+    cache: "no-store"
   });
 
-  // si OK -> parse
-  let text = await r.text();
-  let data = null;
-  try { data = JSON.parse(text); } catch { data = null; }
+  const text = await r.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch {}
 
-  // si auth error y podemos retry: renovar token y reintentar 1 vez
-  if (retry && (data?.error === "auth_required" || data?.error === "wrong_audience")) {
-    try {
-      // fuerza refresh silent otra vez
-      await ensureOAuthToken(false);
-    } catch {
-      if (!allowInteractive) throw new Error("TOKEN_NEEDS_INTERACTIVE");
-      await ensureOAuthToken(true, "consent");
-    }
-
-    // reintento
-    token = oauthAccessToken;
-    payload.access_token = token;
-
-    r = await fetch(API_BASE, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify(payload)
-    });
-
-    text = await r.text();
-    try { return JSON.parse(text); }
-    catch { throw new Error("API_NON_JSON_RESPONSE: " + text.slice(0, 200)); }
-  }
-
-  if (!data) throw new Error("API_NON_JSON_RESPONSE: " + text.slice(0, 200));
-  return data;
+  return { r, status: r.status, url, text, json };
 }
 
+function classifyGoogleApiError_(resp) {
+  const status = Number(resp?.status || 0);
+  const msg = String(resp?.json?.error?.message || resp?.text || "").toLowerCase();
+
+  if (status === 401) return { error: "auth_required" };
+
+  if (status === 403) {
+    if (
+      msg.includes("insufficient authentication scopes") ||
+      msg.includes("access_token_scope_insufficient") ||
+      msg.includes("insufficientpermissions")
+    ) return { error: "missing_scope" };
+
+    return { error: "permission_denied" };
+  }
+
+  if (status === 404) return { error: "not_found_or_no_access" };
+
+  return { error: "http_" + status };
+}
+
+// Convierte valores A2:B -> listaItems
+function valuesToItems_(values) {
+  const rows = Array.isArray(values) ? values : [];
+  return rows
+    .filter(row => (row?.[0] || "").toString().trim() !== "")
+    .map(row => ({
+      texto: (row?.[0] || "").toString(),
+      completado:
+        String(row?.[1] || "").toLowerCase().trim() === "true" ||
+        String(row?.[1] || "").trim() === "1"
+    }));
+}
+
+// Lee items + meta (batchGet)
+async function sheetsGet_(token) {
+  // Resolver título desde GID (cacheado por tu función existente)
+  const sheetTitle = await resolveSheetTitleFromGid_(token);
+  const sheetEsc = encodeURIComponent(sheetTitle);
+
+  const rangeItems = `${sheetTitle}!A2:B`;
+  const rangeMeta = `${sheetTitle}!${META_CELL_A1}`;
+
+  const url =
+    `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(SPREADSHEET_ID)}` +
+    `/values:batchGet?ranges=${encodeURIComponent(rangeItems)}&ranges=${encodeURIComponent(rangeMeta)}` +
+    `&majorDimension=ROWS`;
+
+  const resp = await fetchJson_(url, token);
+  if (!resp?.r?.ok) {
+    const cls = classifyGoogleApiError_(resp);
+    return { ok: false, error: cls.error, status: resp.status, url: resp.url, detail: String(resp.text || "").slice(0, 1200) };
+  }
+
+  const vr = Array.isArray(resp?.json?.valueRanges) ? resp.json.valueRanges : [];
+  const itemsValues = Array.isArray(vr?.[0]?.values) ? vr[0].values : [];
+  const metaValues  = Array.isArray(vr?.[1]?.values) ? vr[1].values : [];
+
+  const updatedAt = Number(metaValues?.[0]?.[0] || 0);
+  const items = valuesToItems_(itemsValues);
+
+  return { ok: true, items, meta: { updatedAt, count: items.length } };
+}
+
+// Escribe toda la lista A2:B + Z1 (batchUpdate)
+// expectedUpdatedAt: si no coincide => conflict
+async function sheetsSet_(token, items, expectedUpdatedAt = 0) {
+  const sheetTitle = await resolveSheetTitleFromGid_(token);
+
+  // 1) leer meta actual (solo Z1) para conflicto rápido
+  const urlMeta =
+    `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(SPREADSHEET_ID)}` +
+    `/values/${encodeURIComponent(sheetTitle + "!" + META_CELL_A1)}?majorDimension=ROWS`;
+
+  const metaResp = await fetchJson_(urlMeta, token);
+  if (!metaResp?.r?.ok) {
+    const cls = classifyGoogleApiError_(metaResp);
+    return { ok: false, error: cls.error, status: metaResp.status, detail: String(metaResp.text || "").slice(0, 1000) };
+  }
+
+  const remoteUA = Number(metaResp?.json?.values?.[0]?.[0] || 0);
+  if (Number(expectedUpdatedAt || 0) !== remoteUA) {
+    // conflicto: devolvemos remoto completo para merge (como en Compras)
+    const full = await sheetsGet_(token);
+    if (full?.ok) {
+      return { ok: false, error: "conflict", items: full.items, meta: full.meta };
+    }
+    return { ok: false, error: "conflict", items: [], meta: { updatedAt: remoteUA, count: 0 } };
+  }
+
+  // 2) normalizar/dedup/ordenar (misma idea que Compras)
+  let clean = (items || [])
+    .map(it => ({ texto: (it?.texto || "").toString().trim(), completado: !!it?.completado }))
+    .filter(it => it.texto !== "");
+
+  const seen = new Set();
+  clean = clean.filter(it => {
+    const k = it.texto.toLowerCase();
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+
+  clean.sort((a, b) => {
+    if (a.completado === b.completado) return a.texto.toLowerCase().localeCompare(b.texto.toLowerCase());
+    return (b.completado === true) - (a.completado === true);
+  });
+
+  if (clean.length === 0) return { ok: false, error: "empty_list_blocked" };
+
+  // 3) preparar values
+  // Para limpiar sobrantes, leemos count remoto (del get rápido) una vez
+  const before = await sheetsGet_(token);
+  const remoteCount = Number(before?.meta?.count || 0);
+
+  const nextUA = Date.now();
+  const maxLen = Math.max(remoteCount, clean.length);
+
+  const values = [];
+  for (let i = 0; i < maxLen; i++) {
+    if (i < clean.length) values.push([clean[i].texto, clean[i].completado ? "TRUE" : "FALSE"]);
+    else values.push(["", ""]);
+  }
+
+  const url =
+    `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(SPREADSHEET_ID)}` +
+    `/values:batchUpdate`;
+
+  const body = {
+    valueInputOption: "USER_ENTERED",
+    data: [
+      { range: `${sheetTitle}!A2:B`, majorDimension: "ROWS", values },
+      { range: `${sheetTitle}!${META_CELL_A1}`, majorDimension: "ROWS", values: [[String(nextUA)]] }
+    ]
+  };
+
+  const resp2 = await fetchJson_(url, token, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+
+  if (!resp2?.r?.ok) {
+    const cls = classifyGoogleApiError_(resp2);
+    return { ok: false, error: cls.error, status: resp2.status, detail: String(resp2.text || "").slice(0, 1200) };
+  }
+
+  return { ok: true, saved: clean.length, meta: { updatedAt: nextUA, count: clean.length } };
+}
+
+// Interfaz “apiCall/apiGet/apiSet” para que el resto de tu código cambie lo mínimo
+async function apiCall(mode, items, extra = {}, { allowInteractive = false } = {}) {
+  // 1) token
+  const token = await ensureOAuthToken(allowInteractive, allowInteractive ? "consent" : "consent");
+
+  // 2) modos
+  const m = String(mode || "").toLowerCase();
+
+  if (m === "get") {
+    return await sheetsGet_(token);
+  }
+
+  if (m === "set") {
+    const expected = Number(extra?.expectedUpdatedAt || 0);
+    return await sheetsSet_(token, items, expected);
+  }
+
+  if (m === "whoami") {
+    // (sin backend) email desde userinfo
+    try {
+      const r = await fetch("https://openidconnect.googleapis.com/v1/userinfo", {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const j = await r.json();
+      return { ok: true, email: String(j?.email || "").trim().toLowerCase() };
+    } catch {
+      return { ok: false, error: "whoami_failed" };
+    }
+  }
+
+  return { ok: false, error: "bad_mode" };
+}
 
 async function apiGet(mode) {
   return await apiCall(mode);
 }
 
-async function apiSet(items, expectedUpdatedAt = 0) {
+async function apiSet(items, expectedUpdatedAt = 0, { allowInteractive = false } = {}) {
   if (!Array.isArray(items)) throw new Error("apiSet_invalid_items");
-  if (items.length === 0) {
-    console.warn("⚠️ apiSet bloqueado: intento de guardar lista vacía");
-    throw new Error("apiSet_empty_blocked");
-  }
-  return await apiCall("set", items, { expectedUpdatedAt: Number(expectedUpdatedAt || 0) }, { allowInteractive: true });
+  if (items.length === 0) throw new Error("apiSet_empty_blocked");
+
+  return await apiCall(
+    "set",
+    items,
+    { expectedUpdatedAt: Number(expectedUpdatedAt || 0) },
+    { allowInteractive: !!allowInteractive }
+  );
 }
 
-// =====================
-// Backend access check (whoami)
-// =====================
+// Ya no hay backend real que validar; dejamos función “compatible” por si la llamás
 async function verifyBackendAccessOrThrow() {
-  // Si ya llegaste acá, normalmente venís de un click que ya obtuvo token interactivo.
-  // Igual hacemos el chequeo real en tu backend.
-  const r = await apiGet("whoami");
-
+  const r = await apiCall("whoami", null, {}, { allowInteractive: true });
   if (r?.ok === true) return r;
-
-  const err = String(r?.error || "auth_required");
-
-  // Si el backend te devuelve estos, mostrarlos claro:
-  if (err === "auth_required") throw new Error("auth_required");
-  if (err === "wrong_audience") throw new Error("wrong_audience");
-  if (err === "missing_scope") throw new Error("missing_scope");
-
-  throw new Error(err || "auth_required");
+  throw new Error(String(r?.error || "auth_required"));
 }
 
 // =====================
@@ -749,16 +1024,16 @@ async function reconnectAndRefresh({ showToast = true } = {}) {
     // 1) Intento SILENT (no popup)
     await ensureOAuthToken(false);
 
-    // 2) Validar backend (allowlist real)
-    const who = await apiGet("whoami");
-    if (who?.ok === true && who.email) {
-      saveStoredOAuthEmail(who.email);
-      setAccountUI(who.email);
+    // 2) Email desde token (sin backend)
+    const em = await fetchUserEmailFromToken(oauthAccessToken);
+    if (em) {
+      saveStoredOAuthEmail(em);
+      setAccountUI(em);
     } else {
       setAccountUI(loadStoredOAuthEmail());
     }
 
-    // 3) Traer lista real
+    // 3) Traer lista real (Sheets API)
     await refreshFromRemote(false);
 
     setSync("ok", "Conectado ✅");
@@ -766,7 +1041,6 @@ async function reconnectAndRefresh({ showToast = true } = {}) {
   } catch (e) {
     const msg = String(e?.message || "");
 
-    // Si silent no pudo -> mostramos estado correcto y dejamos el botón refresh visible
     if (msg === "TOKEN_NEEDS_INTERACTIVE") {
       setSync("offline", "Necesita Conectar");
       if (showToast) toast("Necesitás autorizar", "warn", "Tocá Conectar.");
@@ -875,9 +1149,70 @@ function eliminarElemento(index) {
 let saveTimer = null;
 let saving = false;
 
+// =====================
+// Auto-retry sync pending (backoff) ✅ (igual que Lista de compras)
+// =====================
+let retryTimer = null;
+let retryDelayMs = 2000;
+const RETRY_MAX_MS = 60000;
+
+function resetRetry() {
+  retryDelayMs = 2000;
+  if (retryTimer) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+}
+
+async function scheduleRetry(label = "") {
+  // si ya hay un retry programado, no duplicar
+  if (retryTimer) return;
+
+  // si no hay pending real, no programes nada
+  const p = loadPending();
+  if (!p?.items) return;
+
+  // no reintentar si no hay condiciones mínimas
+  if (!isOnline()) return;
+  if (saving) return;
+
+  // intento silencioso de token; si no se puede, cortamos (evita loops)
+  if (!isTokenValid()) {
+    try {
+      await ensureOAuthToken(false);
+    } catch (e) {
+      // si necesita interacción, no insistir
+      setSync("offline", "Necesita Conectar");
+      return;
+    }
+  }
+
+  if (!isTokenValid()) return;
+
+  retryTimer = setTimeout(async () => {
+    retryTimer = null;
+    try {
+      await trySyncPending();
+
+      // si sigue pendiente, backoff y reintento
+      if (loadPending()?.items) {
+        retryDelayMs = Math.min(Math.floor(retryDelayMs * 1.7), RETRY_MAX_MS);
+        scheduleRetry("retry_loop");
+      } else {
+        resetRetry();
+      }
+    } catch {
+      retryDelayMs = Math.min(Math.floor(retryDelayMs * 1.7), RETRY_MAX_MS);
+      scheduleRetry("retry_loop_err");
+    }
+  }, retryDelayMs);
+}
+
 function scheduleSave(reason = "") {
+  // guardamos cache SIEMPRE (UI instantánea)
   saveCache(listaItems, remoteMeta);
 
+  // offline => cola
   if (!isOnline()) {
     setSync("offline", "Sin conexión — Guardado local");
     setPending(listaItems);
@@ -885,6 +1220,20 @@ function scheduleSave(reason = "") {
     return;
   }
 
+  // Intento silencioso de token (no popup) para no bloquear el click
+  if (!isTokenValid()) {
+    ensureOAuthToken(false).catch(() => { /* noop */ });
+  }
+
+  // si sigue sin token válido, queda en pending
+  if (!isTokenValid()) {
+    setSync("offline", "Necesita Conectar");
+    setPending(listaItems);
+    if (reason) toast("Guardado local", "warn", "Conectá para sincronizar.");
+    return;
+  }
+
+  // UI feedback inmediato
   setSync("saving", "Guardando…");
   clearTimeout(saveTimer);
 
@@ -892,70 +1241,102 @@ function scheduleSave(reason = "") {
     if (saving) return;
     saving = true;
 
+    // ✅ Snapshot LOCAL (para guardar) + versión al inicio
+    const startedVersion = localVersion;
+    const localSnapshot = dedupNormalize(listaItems); // lo que queremos persistir
+
     try {
+      // ✅ OPTIMISTIC SAVE (igual que Lista de compras):
+      // usamos updatedAt que ya tenemos; si está viejo => conflict y re-merge
+      const expectedUA = Number(remoteMeta?.updatedAt || 0);
 
-      const before = await apiGet("get");
-      if (before?.ok !== true) {
-        if (before?.error === "auth_required") throw new Error("TOKEN_NEEDS_INTERACTIVE");
-        throw new Error(String(before?.error || "precheck_failed"));
+      // merge “seguro” sin remoto (si hay conflicto, re-mergeamos con remoto real)
+      // OJO: usamos snapshot, no listaItems viva
+      const merged = mergeRemoteWithLocal([], localSnapshot, tombstones);
+
+      if (merged.length === 0) {
+        setPending(listaItems);
+        setSync("offline", "No se guardó (lista vacía bloqueada)");
+        toast("Bloqueado", "warn", "No se permite guardar una lista vacía por seguridad.");
+        return;
       }
 
-      const remoteItemsNow = Array.isArray(before?.items) ? before.items : [];
-      const remoteUA_now = Number(before?.meta?.updatedAt || 0);
+      // 1er intento (sin popup)
+      let saved = await apiSet(merged, expectedUA, { allowInteractive: false });
 
-      // merge: remoto + local (local gana), menos tombstones (borrados intencionales)
-      const merged = mergeRemoteWithLocal(remoteItemsNow, listaItems, tombstones);
-
-      // guardamos el merge (ahora sí, aunque tu lista estaba vieja)
-      let saved = await apiSet(merged, remoteUA_now);
-
-      // si el backend devolvió conflicto, re-merge con la versión actual y reintentar 1 vez
+      // conflicto => backend nos devuelve items + meta actual, re-merge y reintento 1 vez
       if (saved?.ok === false && saved?.error === "conflict") {
-        const remote2 = Array.isArray(saved?.items) ? saved.items : [];
-        const ua2 = Number(saved?.meta?.updatedAt || 0);
-        const merged2 = mergeRemoteWithLocal(remote2, listaItems, tombstones);
-        saved = await apiSet(merged2, ua2);
+        const remoteItemsNow = Array.isArray(saved?.items) ? saved.items : [];
+        const remoteUA = Number(saved?.meta?.updatedAt || 0);
+
+        const merged2 = mergeRemoteWithLocal(remoteItemsNow, localSnapshot, tombstones);
+        const saved2 = await apiSet(merged2, remoteUA, { allowInteractive: false });
+
+        if (saved2?.ok !== true) throw new Error(String(saved2?.error || "save_failed"));
+
+        saved = saved2;
+
+        // ✅ IMPORTANTE:
+        // NO asignamos listaItems acá todavía (para no pisar clicks nuevos)
+        // Solo guardamos el "resultado final que se guardó"
+        var finalSavedItems = dedupNormalize(merged2);
+      } else {
+        if (saved?.ok !== true) {
+          if (saved?.error === "auth_required") throw new Error("TOKEN_NEEDS_INTERACTIVE");
+          throw new Error(String(saved?.error || "save_failed"));
+        }
+
+        // también: no tocar listaItems todavía
+        var finalSavedItems = dedupNormalize(merged);
       }
 
-      if (saved?.ok !== true) {
-        throw new Error(String(saved?.error || "save_failed"));
+      // ✅ CLAVE (igual que Lista de compras):
+      // si hubo cambios mientras guardábamos, NO pisar estado local
+      if (localVersion !== startedVersion) {
+        setPending(listaItems);          // dejamos la versión más nueva en cola
+        setSync("saving", "Guardando…");
+        saving = false;
+        scheduleSave("");                // reintenta con lo último
+        return;
       }
 
-      // éxito: actualizamos estado local
-      listaItems = merged;
-      localVersion++;
-      render();
+      // ✅ Recién ahora podemos aplicar normalización local (sin perder clicks)
+      listaItems = finalSavedItems;
+
+      // éxito: actualizar meta desde backend
+      remoteMeta = { updatedAt: Number(saved?.meta?.updatedAt || remoteMeta?.updatedAt || 0) };
 
       // ya aplicamos borrados al remoto => limpiamos tombstones
       tombstones.clear();
       saveTombstones(tombstones);
 
-      // refrescar meta local
-      remoteMeta = { updatedAt: Number(saved?.meta?.updatedAt || remoteUA_now || 0) };
       saveCache(listaItems, remoteMeta);
-
-      setPending(listaItems);
-
-      // ✅ Guardado OK: ya aplicamos el MERGE, no necesitamos un GET de confirmación
       clearPending();
+
+      render();
       setSync("ok", "Guardado ✅");
       if (reason) toast("Guardado ✅", "ok", reason);
-      return;
 
     } catch (e) {
       setPending(listaItems);
 
-      if ((e?.message || "") === "TOKEN_NEEDS_INTERACTIVE") {
+      const msg = String(e?.message || "");
+
+      if (msg === "TOKEN_NEEDS_INTERACTIVE") {
         setSync("offline", "Necesita Conectar");
         toast("Necesitás autorizar", "warn", "Tocá el botón Conectar.");
       } else {
         setSync("offline", "No se pudo guardar — Queda en cola");
-        toast("No se pudo guardar", "err", e?.message || "Quedó pendiente, se reintenta solo.");
+        toast("No se pudo guardar", "err", msg || "Quedó pendiente.");
+        // ✅ reintento automático como Lista de compras (lo agregamos en el CAMBIO 2)
+        scheduleRetry("save_failed");
       }
+
     } finally {
       saving = false;
     }
-  }, 650);
+
+  }, 250); // ✅ más “instantáneo” (en compras lo sentís rápido). Ajustable.
 }
 
 async function trySyncPending() {
@@ -1017,6 +1398,9 @@ async function trySyncPending() {
       return;
     }
     setSync("offline", "Sincronización pendiente");
+
+    // ✅ reintento automático con backoff
+    scheduleRetry("trySyncPending_failed");
   }
 
 }
@@ -1030,58 +1414,40 @@ async function refreshFromRemote(showToast = true) {
   }
 
   try {
-    const resp = await apiGet("get");
-    console.log("RESP BACKEND:", resp);
+    // ✅ Traer remoto + meta REAL (Z1)
+    const resp = await apiCall("get", null, {}, { allowInteractive: false });
 
-    if (resp?.ok !== true) {
-      const err = String(resp?.error || "");
-
-      if (err === "auth_required") {
-        setSync("offline", "Necesita Conectar");
-        toast("Necesitás autorizar", "warn", "Tocá el botón Conectar.");
-        // NO borrar token acá
-        return;
-      }
-
-      setSync("offline", "Error backend");
-      toast("Error backend", "err", err || "unknown");
-      return;
+    if (!resp?.ok) {
+      if (resp?.error === "auth_required") throw new Error("TOKEN_NEEDS_INTERACTIVE");
+      throw new Error(String(resp?.error || "get_failed"));
     }
 
     const remoteItems = Array.isArray(resp?.items) ? resp.items : [];
-
-    // limpiar tombstones que ya no tienen sentido (si remoto ya no tiene ese item)
-    try {
-      const remoteKeys = new Set(remoteItems.map(x => keyOf(x?.texto)).filter(Boolean));
-      for (const k of [...tombstones]) {
-        if (!remoteKeys.has(k)) tombstones.delete(k);
-      }
-      saveTombstones(tombstones);
-    } catch { }
-
     const meta = resp?.meta || { updatedAt: 0 };
 
-    // ✅ Si hubo cambios locales mientras cargaba el remoto, NO pisar la lista.
+    // ✅ Si hubo cambios locales mientras cargaba, no pisar UI
     if (localVersion !== startedVersion) {
-      // Igual actualizamos meta para que el cache tenga el updatedAt más nuevo
       remoteMeta = { updatedAt: Number(meta.updatedAt || 0) };
       saveCache(listaItems, remoteMeta);
-
       setSync("ok", "Cambios locales ✅");
       if (showToast) toast("Cambios locales detectados", "warn", "No se reemplazó tu lista por la versión remota.");
       return;
     }
 
+    // merge remoto - tombstones (como ya hacías)
     listaItems = mergeRemoteWithLocal(remoteItems, [], tombstones);
+
     remoteMeta = { updatedAt: Number(meta.updatedAt || 0) };
     saveCache(listaItems, remoteMeta);
     render();
 
     setSync("ok", "Listo ✅");
+    if (showToast) toast("Lista actualizada", "ok", "Se cargó desde Sheets (rápido).");
 
-    if (showToast) toast("Lista actualizada", "ok", "Se cargó desde Drive.");
   } catch (e) {
-    if ((e?.message || "") === "TOKEN_NEEDS_INTERACTIVE") {
+    const msg = String(e?.message || "");
+
+    if (msg === "TOKEN_NEEDS_INTERACTIVE") {
       setSync("offline", "Necesita Conectar");
       if (showToast) toast("Necesitás autorizar", "warn", "Tocá el botón Conectar.");
       return;
@@ -1163,7 +1529,15 @@ buttonImportar.addEventListener("click", () => {
 
 window.addEventListener("online", () => {
   toast("Volvió la conexión", "ok", "Sincronizando…");
-  trySyncPending();
+
+  ensureOAuthToken(false)
+    .catch(() => { /* noop */ })
+    .finally(() => {
+      trySyncPending().finally(() => {
+        // ✅ si quedó pending, reintentar solo
+        scheduleRetry("online_event");
+      });
+    });
 });
 
 window.addEventListener("offline", () => {

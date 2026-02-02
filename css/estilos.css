@@ -326,22 +326,65 @@ button:active { background: #4d4d4d; transform: scale(0.995); }
     min-width: 0;
   }
 
-    .header-row-2 {
-    flex-direction: column;
-    align-items: stretch;
+  /* ===== Header más lindo (solo mobile) ===== */
+
+  /* “Tarjeta” del header */
+  .titulo {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 14px;
+    padding: .9rem .95rem;
+    margin-bottom: 1rem;
     gap: .55rem;
   }
 
+  /* Título un poquito más compacto */
+  .titulo h1 {
+    font-size: 1.45rem;
+    line-height: 1.1;
+    letter-spacing: .2px;
+  }
+
+  /* Layout del bloque: guardado izq, botones der, email abajo */
+  .header-row-2 {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    grid-template-areas:
+      "sync actions"
+      "account account";
+    gap: .55rem .6rem;
+    align-items: center;
+  }
+
+  .sync-pill {
+    grid-area: sync;
+    justify-self: start;
+    width: fit-content;
+  }
+
   .header-actions {
-    width: 100%;
-    justify-content: flex-start;
+    grid-area: actions;
+    justify-self: end;
+    width: auto;
   }
 
+  /* Botones más compactos en mobile */
+  .btn-connect, .btn-refresh {
+    padding: 7px 12px;
+    font-size: 0.86rem;
+  }
+
+  /* Email tipo “chip” */
   .account-pill {
+    grid-area: account;
     max-width: 100%;
-    padding-left: 0;
+    padding: 7px 10px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.06);
+    font-size: 12.5px;
+    color: var(--yt-text-muted);
   }
-
 }
 
 /* ====== Tablet ====== */
