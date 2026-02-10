@@ -25,17 +25,14 @@ const CACHE_TTL_MS = 60_000;
 const OAUTH_CLIENT_ID = "917192108969-6d693ji2l5ku1vsje8s6brvio2j01hio.apps.googleusercontent.com";
 
 
-// scope mínimo para identificar al usuario (email)
+// scope mínimo para identificar al usuario (email) + leer/escribir Sheets
+// (drive.metadata.readonly NO es necesario para leer/escribir una Sheet por ID)
 const OAUTH_SCOPES =
-  "openid email profile " +
   "https://www.googleapis.com/auth/userinfo.email " +
   "https://www.googleapis.com/auth/userinfo.profile " +
-  // ✅ necesario para leer/escribir la planilla directo (Sheets API)
-  "https://www.googleapis.com/auth/spreadsheets " +
-  // ✅ opcional (lo dejás si tu backend usa allowlist con drive metadata)
-  "https://www.googleapis.com/auth/drive.metadata.readonly";
+  "https://www.googleapis.com/auth/spreadsheets";
 
-  // ================== SHEETS API HELPERS (rápido) ==================
+// ================== SHEETS API HELPERS (rápido) ==================
 
 // Resuelve el título real de la pestaña usando el SHEET_GID (sheetId)
 // y lo guarda en localStorage para no pedirlo siempre.
@@ -43,7 +40,7 @@ async function resolveSheetTitleFromGid_(accessToken) {
   // 1) cache
   try {
     const cached = (localStorage.getItem(LS_SHEET_TITLE) || "").trim();
-    if (cached) return cached;
+    if (cached) return { ok: true, title: cached };
   } catch {}
 
   // 2) pedir metadata mínima
@@ -51,21 +48,31 @@ async function resolveSheetTitleFromGid_(accessToken) {
     `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(SPREADSHEET_ID)}` +
     `?fields=sheets(properties(sheetId,title))`;
 
-  const r = await fetch(url, {
-    headers: { Authorization: `Bearer ${accessToken}` }
-  });
-  const txt = await r.text();
-  if (!r.ok) throw new Error("sheet_meta_failed: " + txt.slice(0, 300));
+  const resp = await fetchJson_(url, accessToken);
 
-  const json = JSON.parse(txt);
+  if (!resp?.r?.ok) {
+    const cls = classifyGoogleApiError_(resp);
+    return {
+      ok: false,
+      error: cls.error,
+      status: resp.status,
+      url: resp.url,
+      detail: String(resp.text || "").slice(0, 1200)
+    };
+  }
+
+  let json = resp?.json;
   const sheets = Array.isArray(json?.sheets) ? json.sheets : [];
 
   const found = sheets.find(s => Number(s?.properties?.sheetId) === Number(SHEET_GID));
   const title = (found?.properties?.title || "").toString().trim();
-  if (!title) throw new Error("sheet_title_not_found_for_gid");
+
+  if (!title) {
+    return { ok: false, error: "sheet_title_not_found_for_gid" };
+  }
 
   try { localStorage.setItem(LS_SHEET_TITLE, title); } catch {}
-  return title;
+  return { ok: true, title };
 }
 
 // Lee headers + datos en 1 request (batchGet)
@@ -143,17 +150,22 @@ function cacheWrite_(data) {
 async function forceSwitchAccount() {
   // obliga a Google a mostrar el selector de cuenta
   clearStoredOAuth(); // borra token + email
-
-  // ✅ opcional/recomendado: limpiar caches dependientes de cuenta/sesión
   try { localStorage.removeItem(LS_SHEET_TITLE); } catch {}
 
-  await ensureOAuthToken(true, "select_account");
+  // ✅ FORZAR interactivo (NO silent)
+  await ensureOAuthToken(true, "select_account", true);
+  await ensureOAuthToken(true, "consent", true);
+
+  // ✅ y asegurar spreadsheets
+  await ensureSheetsScopeOrThrow_();
 }
 
 let oauthTokenClient = null;
 let oauthAccessToken = "";
 let oauthExpiresAt = 0;
 
+// Inicializa GIS Token Client
+// Inicializa GIS Token Client
 // Inicializa GIS Token Client
 function initOAuth() {
   oauthTokenClient = google.accounts.oauth2.initTokenClient({
@@ -163,8 +175,11 @@ function initOAuth() {
     // ✅ evita pedir permisos de nuevo si ya fueron otorgados
     include_granted_scopes: true,
 
-    // ✅ clave en browsers con bloqueo de cookies (Brave, etc.)
-    use_fedcm_for_prompt: true,
+    // ✅ IMPORTANTE: mejora el upgrade incremental de scopes (evita tokens “recortados”)
+    enable_serial_consent: true,
+
+    // (lo dejamos apagado como lo tenías; si querés luego lo probamos con Brave)
+    // use_fedcm_for_prompt: true,
 
     callback: () => { }
   });
@@ -181,6 +196,173 @@ async function fetchUserEmailFromToken(token) {
   } catch {
     return "";
   }
+}
+
+// =====================
+// DEBUG: ver scopes reales del access_token
+// =====================
+async function debugTokenScopes_(token) {
+  try {
+    const r = await fetch(`https://oauth2.googleapis.com/tokeninfo?access_token=${encodeURIComponent(token)}`);
+    const txt = await r.text();
+    console.log("[tokeninfo]", txt);
+  } catch (e) {
+    console.warn("[tokeninfo] failed:", e?.message || e);
+  }
+}
+
+// =====================
+// UI helper: falta permiso Sheets (mensaje único y consistente)
+// =====================
+function handleMissingSheetsPermission_() {
+  setSync("offline", "Falta permiso Sheets");
+  setAccountUI(loadStoredOAuthEmail() || "");
+
+  getTokenInfo_(oauthAccessToken).then((info) => {
+    let aud = "";
+    let scopes = "";
+    try {
+      const j = JSON.parse(String(info?.text || "{}"));
+      aud = String(j?.aud || j?.audience || "").trim();
+      scopes = String(j?.scope || "").trim();
+    } catch {}
+
+    toast(
+      "No se pudo obtener permiso de Sheets",
+      "err",
+      (
+        "El token NO trae el permiso de Google Sheets. " +
+        "Solución: Google Cloud Console → Google Auth Platform → Acceso a los datos → Agregar permisos → " +
+        "Google Sheets API → seleccionar '.../auth/spreadsheets' (o readonly) → Guardar. " +
+        "Después: quitar acceso a la app desde tu cuenta Google y reconectar. " +
+        (aud ? (" | aud=" + aud) : "") +
+        (scopes ? (" | scopes=" + scopes) : "")
+      ).slice(0, 900)
+    );
+  }).catch(() => {
+    toast(
+      "No se pudo obtener permiso de Sheets",
+      "err",
+      "El token NO trae el permiso de Google Sheets. Agregá '.../auth/spreadsheets' en Acceso a los datos y reconectá."
+    );
+  });
+}
+
+// =====================
+// tokeninfo helpers (chequeo de scopes)
+// =====================
+async function getTokenInfo_(token) {
+  const r = await fetch(`https://oauth2.googleapis.com/tokeninfo?access_token=${encodeURIComponent(token)}`);
+  const txt = await r.text();
+  return { ok: r.ok, status: r.status, text: txt };
+}
+
+function tokenInfoHasScope_(tokenInfoText, scopeUrl) {
+  try {
+    const raw = String(tokenInfoText || "");
+    // tokeninfo es JSON; a veces estás haciendo includes() sobre texto plano y
+    // podés tener falsos positivos/negativos.
+    const j = JSON.parse(raw);
+    const scopes = String(j?.scope || "")
+      .split(/\s+/)
+      .map(s => s.trim())
+      .filter(Boolean);
+
+    return scopes.includes(scopeUrl);
+  } catch {
+    // fallback: si no fue JSON por algún motivo, mantenemos el comportamiento anterior
+    const t = String(tokenInfoText || "");
+    return t.includes(scopeUrl);
+  }
+}
+
+// ✅ Asegura que el token tenga spreadsheets; si no, revoca+reauth y re-chequea.
+// Si aun así no aparece, cortamos con error claro.
+async function ensureSheetsScopeOrThrow_() {
+  if (!oauthAccessToken) throw new Error("NO_TOKEN");
+
+  const SHEETS_RW = "https://www.googleapis.com/auth/spreadsheets";
+  const SHEETS_RO = "https://www.googleapis.com/auth/spreadsheets.readonly";
+
+  // 1) chequeo actual
+  let info = await getTokenInfo_(oauthAccessToken);
+
+  // Debug claro (para ver exactamente qué scopes trae)
+  try {
+    const j = JSON.parse(String(info.text || "{}"));
+    console.log("[scope] tokeninfo scopes =", j?.scope || "(none)");
+    console.log("[scope] tokeninfo aud =", j?.aud || j?.audience || "(none)");
+  } catch {
+    console.log("[scope] tokeninfo raw =", info.text);
+  }
+
+  if (tokenInfoHasScope_(info.text, SHEETS_RW) || tokenInfoHasScope_(info.text, SHEETS_RO)) return true;
+
+  console.warn("[scope] Falta spreadsheets(.readonly). Intentando revokeAndReauth_()...");
+  await revokeAndReauth_(true);
+
+  // 2) re-chequeo después de reauth
+  info = await getTokenInfo_(oauthAccessToken);
+
+  try {
+    const j2 = JSON.parse(String(info.text || "{}"));
+    console.log("[scope] AFTER reauth tokeninfo scopes =", j2?.scope || "(none)");
+    console.log("[scope] AFTER reauth tokeninfo aud =", j2?.aud || j2?.audience || "(none)");
+  } catch {
+    console.log("[scope] AFTER reauth tokeninfo raw =", info.text);
+  }
+
+  if (tokenInfoHasScope_(info.text, SHEETS_RW) || tokenInfoHasScope_(info.text, SHEETS_RO)) return true;
+
+  // 3) sigue sin aparecer => es configuración OAuth (consent screen / proyecto / test users)
+  handleMissingSheetsPermission_();
+  throw new Error("SPREADSHEETS_SCOPE_NOT_GRANTED");
+}
+
+// =====================
+// FIX: revocar token para forzar upgrade de scopes (spreadsheets)
+// =====================
+// =====================
+// FIX: revocar token para forzar upgrade de scopes (spreadsheets)
+// =====================
+async function revokeAndReauth_(forceSelectAccount = true) {
+  // ✅ Guardar token actual ANTES de limpiar
+  const tokenToRevoke = oauthAccessToken || (function () {
+    try {
+      const raw = localStorage.getItem(LS_OAUTH);
+      if (!raw) return "";
+      const t = JSON.parse(raw);
+      return String(t?.access_token || "");
+    } catch {
+      return "";
+    }
+  })();
+
+  // ✅ Revocar token (revoca token, no necesariamente el grant completo)
+  if (window.google?.accounts?.oauth2?.revoke && tokenToRevoke) {
+    await new Promise((res) => {
+      try {
+        google.accounts.oauth2.revoke(tokenToRevoke, () => res());
+      } catch {
+        res();
+      }
+    });
+  }
+
+  // ✅ Limpieza local fuerte (esto evita que el flujo “silent” te vuelva a traer el recortado)
+  clearStoredOAuth();
+  try { localStorage.removeItem(LS_SHEET_TITLE); } catch {}
+
+  // 🔥 IMPORTANTE:
+  // 1) select_account (si corresponde)
+  // 2) consent FORZADO saltando silent (forceInteractive=true)
+  const firstPrompt = forceSelectAccount ? "select_account" : "consent";
+
+  await ensureOAuthToken(true, firstPrompt, true);
+  await ensureOAuthToken(true, "consent", true);
+
+  // Debug del token final
+  await debugTokenScopes_(oauthAccessToken);
 }
 
 // ✅ Evita carreras: GIS usa un solo callback. Si dos requestAccessToken corren juntos,
@@ -212,7 +394,6 @@ function requestAccessToken({ prompt, hint } = {}) {
         const sub = String(resp.error_subtype || "");
         const msg = (err + (sub ? `:${sub}` : "")).toLowerCase();
 
-        // Normalizamos casos típicos de “silent no permitido”
         if (
           msg.includes("interaction_required") ||
           msg.includes("access_denied") ||
@@ -231,6 +412,15 @@ function requestAccessToken({ prompt, hint } = {}) {
     };
 
     const opts = {};
+
+    // ✅ SIEMPRE scopes explícitos (evita quedarse con scopes viejos)
+    opts.scope = OAUTH_SCOPES;
+
+    // ✅ Mejora incremental auth (cuando hay interacción)
+    if (prompt && prompt !== "") {
+      opts.enable_serial_consent = true;
+    }
+
     if (prompt !== undefined) opts.prompt = prompt; // "" = silent real
     if (hint && hint.includes("@")) opts.hint = hint;
 
@@ -254,13 +444,17 @@ function isTokenValid() {
 // Esto intenta silent SIEMPRE primero. Si falla y allowInteractive=true, abre popup.
 // Esto intenta silent. Si falla y allowInteractive=true, abre popup.
 // ✅ Anti-incógnito: si el token silent viene de OTRO email distinto al hint, se invalida.
-async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "consent") {
-  // 1) si ya está en memoria, OK
-  if (isTokenValid()) return oauthAccessToken;
+// Esto intenta silent. Si falla y allowInteractive=true, abre popup.
+// ✅ NUEVO: si forceInteractive=true, SALTA el silent y fuerza el popup (para pedir scopes nuevos).
+// ✅ NUEVO: si forceInteractive=true, SALTA el silent y fuerza el popup (para pedir scopes nuevos).
+// ✅ FIX: si forceInteractive=true, NO devolver temprano aunque haya token “válido” (porque puede faltar scope).
+async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "consent", forceInteractive = false) {
+  // 1) si ya está en memoria, OK (PERO solo si NO estamos forzando interacción)
+  if (!forceInteractive && isTokenValid()) return oauthAccessToken;
 
-  // 2) si hay token guardado, cargarlo
+  // 2) si hay token guardado, cargarlo (PERO solo si NO estamos forzando interacción)
   const hadStored = loadStoredOAuth();
-  if (isTokenValid()) return oauthAccessToken;
+  if (!forceInteractive && isTokenValid()) return oauthAccessToken;
 
   const hintEmail = loadStoredOAuthEmail();
 
@@ -283,35 +477,38 @@ async function ensureOAuthToken(allowInteractive = false, interactivePrompt = "c
     }
   }
 
-  // 3) Silent real (prompt:"")
-  try {
-    console.log("[ensureOAuthToken] silent refresh, hint =", hintEmail);
+  // ✅ 3) Silent real (prompt:"") SOLO si NO estamos forzando interacción
+  if (!forceInteractive) {
+    try {
+      console.log("[ensureOAuthToken] silent refresh, hint =", hintEmail);
 
-    const r = await requestAccessToken({
-      prompt: "",
-      hint: hintEmail || undefined
-    });
+      const r = await requestAccessToken({
+        prompt: "",
+        hint: hintEmail || undefined
+      });
 
-    if (r?.access_token) {
-      oauthAccessToken = r.access_token;
-      oauthExpiresAt = Date.now() + (Number(r.expires_in || 3600) * 1000);
+      if (r?.access_token) {
+        oauthAccessToken = r.access_token;
+        oauthExpiresAt = Date.now() + (Number(r.expires_in || 3600) * 1000);
 
-      // Guardamos token y validamos mismatch (si hay hint)
-      saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
-      await validateTokenEmailOrThrow_();
+        // Guardamos token y validamos mismatch (si hay hint)
+        saveStoredOAuth(oauthAccessToken, oauthExpiresAt);
+        await validateTokenEmailOrThrow_();
 
-      // Guardar email como hint (si lo conseguimos)
-      const em = await fetchUserEmailFromToken(oauthAccessToken);
-      if (em) saveStoredOAuthEmail(em);
+        // Guardar email como hint (si lo conseguimos)
+        const em = await fetchUserEmailFromToken(oauthAccessToken);
+        if (em) saveStoredOAuthEmail(em);
 
-      return oauthAccessToken;
-    }
-  } catch (e) {
-    const msg = String(e?.message || e || "");
-    console.warn("[ensureOAuthToken] silent refresh failed:", msg);
+        return oauthAccessToken;
+      }
+    } catch (e) {
+      const msg = String(e?.message || e || "");
+      console.warn("[ensureOAuthToken] silent refresh failed:", msg);
 
-    if (!allowInteractive) {
-      throw new Error("TOKEN_NEEDS_INTERACTIVE");
+      if (!allowInteractive) {
+        throw new Error("TOKEN_NEEDS_INTERACTIVE");
+      }
+      // si allowInteractive=true, seguimos al flujo interactivo
     }
   }
 
@@ -484,10 +681,12 @@ function setAccountUI(email) {
 
 // Click: reintentar conexión + refresh sin selector de cuenta (silent first)
 btnRefresh.addEventListener("click", async () => {
+  markUserGesture_(); // ✅ permite fallback interactivo si falta scope/permisos
   await reconnectAndRefresh({ showToast: true });
 });
 
 btnConnect.addEventListener("click", async () => {
+  markUserGesture_(); // ✅ gesto real (permite abrir consentimiento si falta scope)
   uiBusyStart("btnConnect_click");
 
   try {
@@ -500,8 +699,34 @@ btnConnect.addEventListener("click", async () => {
     if (isSwitch) {
       await forceSwitchAccount(); // limpia y abre selector (select_account)
     } else {
-      // ✅ En incógnito conviene SIEMPRE select_account para no quedar pegado a otra cuenta
+      // 1) selector de cuenta
       await ensureOAuthToken(true, "select_account");
+
+      // 2) ✅ FORZAR consentimiento para pedir/actualizar scopes (spreadsheets)
+      // IMPORTANTE: salta el silent para evitar quedar con token viejo sin scopes.
+      await ensureOAuthToken(true, "consent", true);
+    }
+
+    await debugTokenScopes_(oauthAccessToken);
+
+    // ✅ Bloqueo duro: si no conseguimos spreadsheets, NO seguimos
+    try {
+      await ensureSheetsScopeOrThrow_();
+    } catch (e) {
+      const msg = String(e?.message || "");
+
+      if (msg === "SPREADSHEETS_SCOPE_NOT_GRANTED") {
+        setSync("offline", "Falta permiso Sheets");
+        setAccountUI(loadStoredOAuthEmail() || "");
+        toast(
+          "No se pudo obtener permiso de Sheets",
+          "err",
+          "Esto ya no es el código. Revisá en Google Cloud Console: OAuth Consent Screen → Publishing status (Testing) y agregá tu email como Test User, o publicá la app. Luego tocá Conectar de nuevo."
+        );
+        return; // 👈 IMPORTANTÍSIMO: cortamos acá
+      }
+
+      throw e;
     }
 
     // 2) (rápido) Validación directa: email desde token (sin backend)
@@ -907,17 +1132,36 @@ async function fetchJson_(url, token, options = {}) {
 
 function classifyGoogleApiError_(resp) {
   const status = Number(resp?.status || 0);
-  const msg = String(resp?.json?.error?.message || resp?.text || "").toLowerCase();
+
+  // mensaje “humano” típico de Google APIs
+  const rawMsg =
+    String(resp?.json?.error?.message || resp?.text || "").toLowerCase();
 
   if (status === 401) return { error: "auth_required" };
 
   if (status === 403) {
+    // ✅ scopes insuficientes
     if (
-      msg.includes("insufficient authentication scopes") ||
-      msg.includes("access_token_scope_insufficient") ||
-      msg.includes("insufficientpermissions")
-    ) return { error: "missing_scope" };
+      rawMsg.includes("insufficient authentication scopes") ||
+      rawMsg.includes("access_token_scope_insufficient") ||
+      rawMsg.includes("insufficientpermissions")
+    ) {
+      return { error: "missing_scope" };
+    }
 
+    // ✅ API no habilitada / proyecto equivocado (CLÁSICO)
+    // Mensajes típicos: "accessNotConfigured", "has not been used in project", "API has not been used..."
+    if (
+      rawMsg.includes("accessnotconfigured") ||
+      rawMsg.includes("has not been used in project") ||
+      rawMsg.includes("api has not been used") ||
+      rawMsg.includes("google sheets api has not been used") ||
+      rawMsg.includes("access not configured")
+    ) {
+      return { error: "api_not_enabled" };
+    }
+
+    // ✅ permiso del archivo (no sos editor / no tenés acceso)
     return { error: "permission_denied" };
   }
 
@@ -941,9 +1185,11 @@ function valuesToItems_(values) {
 
 // Lee items + meta (batchGet)
 async function sheetsGet_(token) {
-  // Resolver título desde GID (cacheado por tu función existente)
-  const sheetTitle = await resolveSheetTitleFromGid_(token);
-  const sheetEsc = encodeURIComponent(sheetTitle);
+  // 1) resolver título desde GID (ahora devuelve {ok,title} o error estructurado)
+  const titleRes = await resolveSheetTitleFromGid_(token);
+  if (!titleRes?.ok) return titleRes;
+
+  const sheetTitle = titleRes.title;
 
   const rangeItems = `${sheetTitle}!A2:B`;
   const rangeMeta = `${sheetTitle}!${META_CELL_A1}`;
@@ -954,9 +1200,16 @@ async function sheetsGet_(token) {
     `&majorDimension=ROWS`;
 
   const resp = await fetchJson_(url, token);
+
   if (!resp?.r?.ok) {
     const cls = classifyGoogleApiError_(resp);
-    return { ok: false, error: cls.error, status: resp.status, url: resp.url, detail: String(resp.text || "").slice(0, 1200) };
+    return {
+      ok: false,
+      error: cls.error,
+      status: resp.status,
+      url: resp.url,
+      detail: String(resp.text || "").slice(0, 1200)
+    };
   }
 
   const vr = Array.isArray(resp?.json?.valueRanges) ? resp.json.valueRanges : [];
@@ -974,7 +1227,9 @@ async function sheetsGet_(token) {
 // Escribe toda la lista A2:B + Z1 (batchUpdate)
 // expectedUpdatedAt: si no coincide => conflict
 async function sheetsSet_(token, items, expectedUpdatedAt = 0) {
-  const sheetTitle = await resolveSheetTitleFromGid_(token);
+  const titleRes = await resolveSheetTitleFromGid_(token);
+  if (!titleRes?.ok) return titleRes;
+  const sheetTitle = titleRes.title;
 
   // ✅ 1) UN SOLO GET para conflicto + remoteCount (A2:B + Z1)
   const before = await sheetsGet_(token);
@@ -1387,7 +1642,19 @@ function scheduleSave(reason = "") {
       // 2) Si falla por auth/scope -> pedir interacción (consent)
       if (saved?.ok === false && (saved?.error === "auth_required" || saved?.error === "missing_scope")) {
         if (!allowInteractive) throw new Error("TOKEN_NEEDS_INTERACTIVE");
-        saved = await apiSet(merged, expectedUA, { allowInteractive: true });
+
+        // 🔥 upgrade completo (revoca + select_account + consent) porque en tu caso consent solo no alcanza
+        await revokeAndReauth_(true);
+        await debugTokenScopes_(oauthAccessToken);
+
+        // Reintento
+        saved = await apiSet(merged, expectedUA, { allowInteractive: false });
+
+        // Si sigue faltando scope, ya no insistimos: es configuración OAuth
+        if (saved?.ok === false && saved?.error === "missing_scope") {
+          handleMissingSheetsPermission_();
+          throw new Error("SPREADSHEETS_SCOPE_NOT_GRANTED");
+        }
       }
 
       // 3) ✅ Si falla por "permission_denied" o "not_found_or_no_access",
@@ -1412,7 +1679,12 @@ function scheduleSave(reason = "") {
         // auth/scope -> consent
         if (saved2?.ok === false && (saved2?.error === "auth_required" || saved2?.error === "missing_scope")) {
           if (!allowInteractive) throw new Error("TOKEN_NEEDS_INTERACTIVE");
-          saved2 = await apiSet(merged2, remoteUA, { allowInteractive: true });
+
+          // ✅ FORZAR consentimiento para “upgrade” de scopes
+          await ensureOAuthToken(true, "consent", true);
+
+          // Reintento con token ya corregido
+          saved2 = await apiSet(merged2, remoteUA, { allowInteractive: false });
         }
 
         // ✅ permiso/no access -> selector de cuenta
@@ -1473,7 +1745,10 @@ function scheduleSave(reason = "") {
         toast("Necesitás autorizar", "warn", "Tocá el botón Conectar.");
       } else {
         setSync("offline", "No se pudo guardar — Queda en cola");
-        toast("No se pudo guardar", "err", msg || "Quedó pendiente.");
+        toast("No se pudo guardar", "err",
+          (msg || "Quedó pendiente.") +
+          " (Tip: si es 403, mirá si sos EDITOR o si la Sheets API está habilitada en el mismo proyecto del OAuth)"
+        );
         scheduleRetry("save_failed");
       }
 
@@ -1565,21 +1840,56 @@ async function refreshFromRemote(showToast = true) {
   uiBusyStart("refreshFromRemote");
 
   try {
-    // ✅ Traer remoto + meta REAL (Z1)
-    const resp = await apiCall("get", null, {}, { allowInteractive: false });
+    // ✅ 1) primer intento (sin popup)
+    let resp = await apiCall("get", null, {}, { allowInteractive: false });
+
+    // ✅ 2) Si falta scope (token sin spreadsheets), intentamos upgrade y si no, mostramos ayuda clara
+    if (resp?.ok === false && resp?.error === "missing_scope") {
+      const allowInteractive = canUseInteractiveNow_();
+      if (!allowInteractive) throw new Error("TOKEN_NEEDS_INTERACTIVE");
+
+      // intenta upgrade real (select_account + consent)
+      await revokeAndReauth_(true);
+      await debugTokenScopes_(oauthAccessToken);
+
+      // reintento
+      resp = await apiCall("get", null, {}, { allowInteractive: false });
+
+      // si sigue faltando scope, cortar con mensaje unificado
+      if (resp?.ok === false && resp?.error === "missing_scope") {
+        handleMissingSheetsPermission_();
+        throw new Error("SPREADSHEETS_SCOPE_NOT_GRANTED");
+      }
+    }
 
     if (!resp?.ok) {
       // auth => pedir conectar
       if (resp?.error === "auth_required") throw new Error("TOKEN_NEEDS_INTERACTIVE");
 
-      // ✅ CLAVE incógnito: si la cuenta no tiene acceso (403/404),
-      // limpiamos estado para obligar a elegir otra cuenta con permisos.
+      // ✅ API no habilitada / proyecto equivocado
+      if (resp?.error === "api_not_enabled") {
+        const d = String(resp?.detail || "").slice(0, 700);
+        toast(
+          "Sheets API no habilitada (403)",
+          "err",
+          d || "Revisá que el OAuth Client ID pertenezca al MISMO proyecto donde activaste Google Sheets API."
+        );
+        throw new Error("api_not_enabled");
+      }
+
+      // cuenta sin acceso o spreadsheet no accesible => obligar selector
       if (resp?.error === "permission_denied" || resp?.error === "not_found_or_no_access") {
+        const d = String(resp?.detail || "").slice(0, 260);
         clearStoredOAuth();
         setAccountUI("");
+        toast("Sin acceso a la planilla (403)", "warn",
+          d || "Probá Conectar y elegí la cuenta que sea EDITOR de la planilla.");
         throw new Error("TOKEN_NEEDS_INTERACTIVE");
       }
 
+      // otros
+      const d = String(resp?.detail || "").slice(0, 260);
+      toast("Error al leer Sheets", "err", (resp?.error || "get_failed") + (d ? " — " + d : ""));
       throw new Error(String(resp?.error || "get_failed"));
     }
 
@@ -1599,7 +1909,7 @@ async function refreshFromRemote(showToast = true) {
       return;
     }
 
-    // merge remoto - tombstones (como ya hacías)
+    // merge remoto - tombstones
     listaItems = mergeRemoteWithLocal(remoteItems, [], tombstones);
 
     remoteMeta = {
@@ -1617,7 +1927,6 @@ async function refreshFromRemote(showToast = true) {
     const msg = String(e?.message || "");
 
     if (msg === "TOKEN_NEEDS_INTERACTIVE") {
-      // ✅ Este setSync ya no va a parpadear si estamos busy
       setSync("offline", "Necesita Conectar");
       if (showToast) toast("Necesitás autorizar", "warn", "Tocá el botón Conectar.");
       return;
